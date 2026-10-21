@@ -16,6 +16,10 @@ import os
 import random
 import time
 import uuid
+from dotenv import load_dotenv
+from delivery_support import DeliveryMixin, atomic_json, parse_buttons, button_markup, snapshot_message, parse_duration, BUTTON_HELP
+
+load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(
@@ -25,7 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-BOT_TOKEN = "8564056187:AAFp3wRhxS0QNZH4hmadjKLuYwsAbA2koG8"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHANNEL_ID = -1001140244688
 BOT_USERNAME = "godjuusatoru_bot"
 WELCOME_STORE_PATH = "welcome_messages.json"
@@ -48,11 +52,11 @@ WELCOME_JOIN_WINDOW = 240
 GATE_START_PAYLOAD = "welcome"
 GATE_BUTTON_TEXT = "🔓 ОТКРЫТЬ ДОСТУП"
 
-class SimpleBot:
+class SimpleBot(DeliveryMixin):
     def __init__(self):
-        self.bot_token = BOT_TOKEN
-        self.channel_id = CHANNEL_ID
-        self.admin_ids = ADMIN_IDS
+        self.bot_token = os.getenv("BOT_TOKEN", BOT_TOKEN).strip()
+        self.channel_id = int(os.getenv("CHANNEL_ID", str(CHANNEL_ID)))
+        self.admin_ids = [int(x.strip()) for x in os.getenv("ADMIN_IDS", ",".join(map(str, ADMIN_IDS))).split(",") if x.strip()]
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
         self.welcome_messages = []
         self.auto_accept = False
@@ -136,6 +140,14 @@ class SimpleBot:
         self.load_pending_welcome_jobs()
         # Загрузка списка тех, кто уже открыл диалог с ботом
         self.load_started_users()
+        self.init_delivery()
+        recovered = False
+        for job in self.pending_welcome_jobs:
+            if job.get("status") == "sending":
+                job.update(status="unknown", last_error="Перезапуск во время отправки")
+                recovered = True
+        if recovered:
+            self.save_pending_welcome_jobs()
 
     def load_started_users(self):
         """Загрузить тех, кто нажимал Start, чтобы им можно было писать всегда."""
@@ -151,22 +163,14 @@ class SimpleBot:
             logger.error(f"Ошибка загрузки открытых диалогов: {error}")
 
     def save_started_users(self):
-        """Атомарно сохранить список открытых диалогов."""
-        temp_path = f"{STARTED_USERS_PATH}.tmp"
-        try:
-            with open(temp_path, "w", encoding="utf-8") as file:
-                json.dump(sorted(self.started_users), file)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(temp_path, STARTED_USERS_PATH)
-        except Exception as error:
-            logger.error(f"Ошибка сохранения открытых диалогов: {error}")
+        atomic_json(STARTED_USERS_PATH, sorted(self.started_users))
 
     def gate_keyboard(self):
         """Кнопка-диплинк, открывающая боту доступ к личке пользователя."""
         return {"inline_keyboard": [[{
-            "text": GATE_BUTTON_TEXT,
-            "url": f"https://t.me/{BOT_USERNAME}?start={GATE_START_PAYLOAD}",
+            "text": "🔓 Получать сообщения от бота",
+            "style": "success",
+            "url": f"https://t.me/{getattr(self, 'bot_username', BOT_USERNAME)}?start={GATE_START_PAYLOAD}",
         }]]}
 
     @staticmethod
@@ -210,7 +214,7 @@ class SimpleBot:
                 use_dns_cache=True,
                 keepalive_timeout=60,
                 enable_cleanup_closed=True,
-                ssl=False,  # Отключаем SSL верификацию для работы в локальной среде
+                ssl=True,  # Проверяем сертификат Telegram
                 family=2  # Используем только IPv4
             )
 
@@ -241,73 +245,45 @@ class SimpleBot:
             await self.connector.close()
 
     async def make_request_with_retry(self, method, url, data=None, params=None, max_retries=3):
-        """Выполнить HTTP запрос с повторными попытками"""
-        last_error = None
-        # Отправку сообщения нельзя повторять слепо: если Telegram успел
-        # принять запрос, а ответ не дошёл, повтор создаёт второе сообщение.
-        repeatable = not url.rsplit("/", 1)[-1].startswith(("send", "copy", "forward"))
-
-        for attempt in range(max_retries):
+        name = url.rsplit("/", 1)[-1]
+        sending = name.startswith(("send", "copy", "forward"))
+        await self.initialize_session()
+        for attempt in range(max_retries + 2):
+            payload = self.presentation(data)
+            if sending and payload and payload.get("chat_id"):
+                await self.pace.wait(payload["chat_id"])
+            elif self.pace.cooldown > time.monotonic():
+                await asyncio.sleep(self.pace.cooldown - time.monotonic())
             try:
-                async with self.rate_limiter:  # Ограничение скорости
-                    await self.initialize_session()
-
-                    try:
-                        if method == 'POST':
-                            async with self.session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                                result = await response.json()
-                        else:  # GET
-                            async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                                result = await response.json()
-                    except asyncio.TimeoutError:
-                        last_error = "Timeout"
-                        if not repeatable:
-                            logger.warning(f"Таймаут отправки, повтор не делаем: {url.rsplit('/', 1)[-1]}")
-                            return {"ok": False, "error_code": 0, "description": "Timeout"}
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(1 * (attempt + 1))
-                            continue
-                        else:
-                            logger.error(f"Таймаут после {max_retries} попыток")
-                            raise asyncio.TimeoutError("Timeout after retries")
-
-                    # Проверяем на ошибки Telegram API
-                    if not result.get("ok"):
-                        error_code = result.get("error_code")
-                        if error_code == 429:  # Too Many Requests
-                            retry_after = result.get("parameters", {}).get("retry_after", 1)
-                            if attempt < max_retries - 1:
-                                await asyncio.sleep(retry_after)
-                                continue
-                        elif error_code in [400, 401, 403, 404]:
-                            # Критические ошибки, не повторяем
-                            return result
-
+                async with self.rate_limiter:
+                    if method == 'POST':
+                        async with self.session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=35)) as response:
+                            result = await response.json()
+                    else:
+                        async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=35)) as response:
+                            result = await response.json()
+                if result.get('ok'):
                     return result
-
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                last_error = str(e)
-                if not repeatable:
-                    logger.warning(f"Сбой сети при отправке, повтор не делаем: {e}")
-                    return {"ok": False, "error_code": 0, "description": str(e)}
-                if attempt == max_retries - 1:
-                    logger.error(f"Ошибка HTTP запроса после {max_retries} попыток: {e}")
-                    raise e
-
-                # Exponential backoff с jitter
-                wait_time = (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(f"Попытка {attempt + 1} неудачна, ждем {wait_time:.1f} сек: {e}")
-                await asyncio.sleep(wait_time)
-
-            except Exception as e:
-                logger.error(f"Неожиданная ошибка при запросе: {e}")
-                last_error = str(e)
-                if attempt == max_retries - 1:
-                    raise e
-                await asyncio.sleep(1)
-
-        # Если все попытки исчерпаны
-        raise Exception(f"Все попытки неудачны. Последняя ошибка: {last_error}")
+                if result.get('error_code') == 429:
+                    retry_after = max(1, float(result.get('parameters', {}).get('retry_after', 1)))
+                    self.pace.flood(retry_after)
+                    if attempt < max_retries - 1:
+                        continue
+                    return result
+                if self.presentation_error(result) and attempt < max_retries + 1:
+                    continue
+                if result.get('error_code', 0) >= 500 and sending:
+                    return dict(result, delivery_unknown=True)
+                return result
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+                # Never log the request URL: it contains a credential.
+                log_type = type(e).__name__
+                if sending:
+                    return {'ok': False, 'error_code': 0, 'description': log_type, 'delivery_unknown': True}
+                if attempt >= max_retries - 1:
+                    return {'ok': False, 'error_code': 0, 'description': log_type}
+                await asyncio.sleep(min(8, 2 ** attempt))
+        return {'ok': False, 'error_code': 0, 'description': 'Retry budget exhausted', 'delivery_unknown': sending}
 
     def load_welcome_messages(self):
         """Загрузить приветствия из JSON файла"""
@@ -343,14 +319,7 @@ class SimpleBot:
         self.welcome_messages.sort(key=lambda msg: max(0, int(msg.get("delay", 0) or 0)))
 
     def save_welcome_messages(self):
-        """Сохранить приветствия в JSON файл"""
-        try:
-            self.sort_welcome_messages()
-            with open(WELCOME_STORE_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.welcome_messages, f, ensure_ascii=False, indent=2)
-            logger.info("Приветствия сохранены")
-        except Exception as e:
-            logger.error(f"Ошибка сохранения приветствий: {e}")
+        atomic_json(WELCOME_STORE_PATH, self.welcome_messages)
 
     def load_pending_welcome_jobs(self):
         """Загрузить отложенные приветствия после перезапуска."""
@@ -387,9 +356,6 @@ class SimpleBot:
             migrated += 1
             # Момент отправки давно прошёл - выкидываем, иначе после
             # перезапуска на людей вывалится вся накопленная цепочка сразу.
-            if job.get("status", "pending") == "pending" and float(job["due_at"]) < now - WELCOME_STALE_GRACE:
-                dropped += 1
-                continue
             kept.append(job)
         if migrated:
             self.pending_welcome_jobs = kept
@@ -400,21 +366,8 @@ class SimpleBot:
             self.save_pending_welcome_jobs()
 
     def save_pending_welcome_jobs(self):
-        """Атомарно сохранить очередь, чтобы не потерять её при сбое."""
-        temp_path = f"{PENDING_WELCOME_STORE_PATH}.tmp"
-        try:
-            with open(temp_path, "w", encoding="utf-8") as file:
-                json.dump(self.pending_welcome_jobs, file, ensure_ascii=False, indent=2)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(temp_path, PENDING_WELCOME_STORE_PATH)
-        except Exception as error:
-            logger.error(f"Ошибка сохранения очереди приветствий: {error}")
-            try:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-            except OSError:
-                pass
+        # Persistence failure must prevent sending, not erase delivery receipts.
+        atomic_json(PENDING_WELCOME_STORE_PATH, self.pending_welcome_jobs)
 
     def load_settings(self):
         """Загрузить настройки бота из JSON"""
@@ -440,19 +393,10 @@ class SimpleBot:
             logger.error(f"Ошибка загрузки настроек: {e}")
 
     def save_settings(self):
-        """Сохранить настройки бота в JSON"""
-        try:
-            data = {
-                "auto_accept": self.auto_accept,
-                "auto_delay": self.auto_delay,
-                "schedules": self.schedules,
-                "daily_broadcast": self.daily_broadcast,
-            }
-            with open(SETTINGS_STORE_PATH, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            logger.info("Настройки сохранены")
-        except Exception as e:
-            logger.error(f"Ошибка сохранения настроек: {e}")
+        atomic_json(SETTINGS_STORE_PATH, {
+            "auto_accept": self.auto_accept, "auto_delay": self.auto_delay,
+            "schedules": self.schedules, "daily_broadcast": self.daily_broadcast,
+        })
 
     def load_subscribers(self):
         """Загрузить список подписчиков из JSON файла"""
@@ -467,13 +411,7 @@ class SimpleBot:
             logger.error(f"Ошибка загрузки подписчиков: {e}")
 
     def save_subscribers(self):
-        """Сохранить список подписчиков в JSON файл"""
-        try:
-            with open(self.subscribers_file, "w", encoding="utf-8") as f:
-                json.dump(list(self.subscribers), f, ensure_ascii=False, indent=2)
-            logger.info(f"Подписчики сохранены: {len(self.subscribers)}")
-        except Exception as e:
-            logger.error(f"Ошибка сохранения подписчиков: {e}")
+        atomic_json(self.subscribers_file, sorted(self.subscribers))
 
     def add_subscriber(self, user_id):
         """Добавить подписчика и сохранить"""
@@ -498,12 +436,7 @@ class SimpleBot:
             logger.error(f"Ошибка загрузки дат подписок: {e}")
 
     def save_subscriber_dates(self):
-        """Сохранить даты подписок в отдельный файл"""
-        try:
-            with open(SUBSCRIBER_DATES_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.subscriber_dates, f, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"Ошибка сохранения дат подписок: {e}")
+        atomic_json(SUBSCRIBER_DATES_PATH, self.subscriber_dates)
 
     def subscription_counts(self):
         """Посчитать подписки за сегодня и за последние 7 дней"""
@@ -526,18 +459,18 @@ class SimpleBot:
         """Конвертировать Telegram entities в HTML форматирование"""
         if not entities:
             return text
-        
+
         # Создаем список изменений (offset, length, replacement)
         replacements = []
-        
+
         for entity in entities:
             offset = entity['offset']
             length = entity['length']
             entity_type = entity['type']
-            
+
             # Извлекаем текст entity
             entity_text = text[offset:offset + length]
-            
+
             # Применяем форматирование в зависимости от типа
             if entity_type == 'bold':
                 formatted = f'<b>{entity_text}</b>'
@@ -563,17 +496,17 @@ class SimpleBot:
             else:
                 # Для неизвестных типов оставляем как есть
                 formatted = entity_text
-            
+
             replacements.append((offset, length, formatted))
-        
+
         # Сортируем по offset в обратном порядке, чтобы не сбивать индексы
         replacements.sort(key=lambda x: x[0], reverse=True)
-        
+
         # Применяем замены
         result = text
         for offset, length, formatted in replacements:
             result = result[:offset] + formatted + result[offset + length:]
-        
+
         return result
 
     async def send_message(self, chat_id, text, reply_markup=None):
@@ -754,8 +687,7 @@ class SimpleBot:
 
     def broadcast_markup(self, preview=False):
         """Кнопки получателя и, только в предпросмотре, кнопки управления."""
-        rows = [[{"text": button["text"], "url": button["url"]}]
-                for button in self.broadcast_buttons]
+        rows = [[copy.deepcopy(button)] for button in self.broadcast_buttons]
         if preview:
             rows.extend([
                 [{"text": "➕ Добавить кнопку", "callback_data": "broadcast_add_button"}],
@@ -771,6 +703,7 @@ class SimpleBot:
         self.broadcast_items.append({
             "from_chat_id": message["chat"]["id"],
             "message_id": message["message_id"],
+            "snapshot": snapshot_message(message),
         })
         if self.broadcast_collect_timer:
             self.broadcast_collect_timer.cancel()
@@ -785,40 +718,46 @@ class SimpleBot:
                 }
                 await self.show_broadcast_preview(message["chat"]["id"])
 
-        self.broadcast_collect_timer = asyncio.create_task(finish_collection())
+        self.broadcast_collect_timer = self.spawn(finish_collection())
 
     async def handle_message(self, message):
         """Обработка сообщений"""
         chat_id = message["chat"]["id"]
         user_id = message["from"]["id"]
 
-        # Любое личное сообщение означает, что диалог с ботом открыт.
-        if (
-            message["chat"].get("type") == "private"
-            and user_id not in self.admin_ids
-            and user_id not in self.started_users
-            and not (message.get("text") or "").startswith("/start")
-        ):
-            self.started_users.add(user_id)
-            self.save_started_users()
-            logger.info(f"Диалог с ботом открыт: {user_id}")
-        
+        if message["chat"].get("type") != "private":
+            return
+        text_command = (message.get("text") or "").split(maxsplit=1)[0].split("@")[0] if message.get("text") else ""
+        was_started = user_id in self.started_users
+        self.register_private(user_id, restart=text_command == "/start",
+                              source="write_access_allowed" if message.get("write_access_allowed") else "private_message")
+        if user_id in self.admin_ids and self.editor_busy(user_id):
+            await self.send_message(chat_id, "Другой администратор редактирует черновик. Дождитесь завершения.")
+            return
+        if text_command in ("/stop", "/unsubscribe"):
+            self.recipient(user_id, opted_out=True)
+            await self.send_message(chat_id, "Рассылки и отложенные сообщения отключены. Чтобы включить снова, нажмите /start.")
+            return
+        if text_command == "/start" and user_id not in self.admin_ids:
+            await self.handle_user_start(message, first_time=not was_started)
+            return
+
         # Обработка текстовых сообщений
         if "text" in message:
             text = message["text"]
-            
+
             # /start может прийти с параметром из диплинка: "/start welcome"
-            if text.startswith("/start"):
+            if text_command == "/start":
                 if user_id in self.admin_ids:
-                    await self.send_message(chat_id, "🔧 <b>Админ панель</b>\n\nВыберите действие:", 
+                    await self.send_message(chat_id, "🔧 <b>Админ панель</b>\n\nВыберите действие:",
                                           self.get_main_menu())
                 else:
                     await self.handle_user_start(message)
-            
+
             elif text == "/admin" and user_id in self.admin_ids:
-                await self.send_message(chat_id, "🔧 <b>Админ панель</b>\n\nВыберите действие:", 
+                await self.send_message(chat_id, "🔧 <b>Админ панель</b>\n\nВыберите действие:",
                                       self.get_main_menu())
-            
+
             # Обработка приветственных сообщений от админа
             elif user_id in self.admin_ids and chat_id == user_id:  # Личные сообщения админу
                 # Название и URL кнопки вводятся после создания предпросмотра.
@@ -849,23 +788,25 @@ class SimpleBot:
                 elif self.broadcast_waiting_for_button_title:
                     self.broadcast_waiting_for_button_title = False
                     self.broadcast_pending_button_title = text.strip()
-                    if not self.broadcast_pending_button_title:
+                    shift = len(text[:len(text) - len(text.lstrip())].encode('utf-16-le')) // 2
+                    self.broadcast_title_entities = [dict(e, offset=e['offset'] - shift)
+                        for e in message.get("entities", []) if e.get('offset', 0) >= shift]
+                    if not self.broadcast_pending_button_title or len(self.broadcast_pending_button_title) > 64:
                         await self.send_message(chat_id, "Введите непустое название кнопки.")
                         self.broadcast_waiting_for_button_title = True
                     else:
                         self.broadcast_waiting_for_button_url = True
-                        await self.send_message(chat_id, "Теперь отправьте ссылку для этой кнопки (https://...).")
+                        await self.send_message(chat_id, "Теперь отправьте ссылку. Можно дописать цвет и ID: <code>https://example.com | зелёный | 12345</code>. Цвет и ID необязательны.")
                     return
                 elif self.broadcast_waiting_for_button_url:
-                    url = text.strip()
-                    if not re.match(r"^https?://\S+$", url, re.IGNORECASE):
-                        await self.send_message(chat_id, "Нужна корректная ссылка, начинающаяся с https:// или http://.")
+                    try:
+                        button = parse_buttons(self.broadcast_pending_button_title + " | " + text.strip(),
+                                               self.broadcast_title_entities)[0]
+                    except ValueError as error:
+                        await self.send_message(chat_id, html.escape(str(error)))
                         return
+                    self.broadcast_buttons.append(button)
                     self.broadcast_waiting_for_button_url = False
-                    self.broadcast_buttons.append({
-                        "text": self.broadcast_pending_button_title,
-                        "url": url,
-                    })
                     self.broadcast_pending_button_title = None
                     self.broadcast_preview_data["buttons"] = list(self.broadcast_buttons)
                     if self.broadcast_preview_message_id:
@@ -880,6 +821,9 @@ class SimpleBot:
                     await self.collect_broadcast_item(message)
                     return
                 # Ожидание ввода даты для ручного приема
+                elif self.waiting_for_manual_count:
+                    await self.handle_manual_count_input(message, text)
+                    return
                 elif self.waiting_for_date:
                     self.waiting_for_date = False
                     await self.handle_date_input(message, text)
@@ -926,11 +870,16 @@ class SimpleBot:
                 else:
                     # Игнорируем случайные сообщения от админа
                     pass
-        
+
         # Любой поддерживаемый Bot API медиа-тип можно добавить в рассылку.
-        elif any(key in message for key in ("photo", "video", "animation", "document", "audio", "voice")) and user_id in self.admin_ids:
+        elif any(key in message for key in ("photo", "video", "animation", "document", "audio", "voice")) and user_id in self.admin_ids and chat_id == user_id:
+            if self.waiting_for_welcome_text_edit:
+                await self.handle_welcome_text_edit(message)
+                return
             if self.waiting_for_broadcast and chat_id == user_id:
                 await self.collect_broadcast_item(message)
+                return
+            if not self.waiting_for_welcome_text:
                 return
             if "photo" in message:
                 await self.handle_welcome_photo(message)
@@ -946,10 +895,15 @@ class SimpleBot:
         logger.info(f"Обрабатываем callback: {data}")
         user_id = callback_query["from"]["id"]
         message = callback_query["message"]
-        
-        if user_id not in self.admin_ids:
+
+        if user_id not in self.admin_ids or message["chat"].get("type", "private") != "private" or message["chat"]["id"] != user_id:
             await self.answer_callback_query(query_id, "У вас нет прав администратора!")
             return
+
+        if self.editor_busy(user_id):
+            await self.answer_callback_query(query_id, "Другой администратор редактирует черновик.")
+            return
+        self.editor_user_id = user_id
 
         # Ответ на нажатие даём один раз: либо это осмысленная всплывашка из
         # notify(), либо в конце просто гасим "часики" на кнопке.
@@ -1028,7 +982,7 @@ class SimpleBot:
                     message["chat"]["id"], message["message_id"],
                     self.broadcast_markup(preview=True),
                 )
-                await self.send_message(message["chat"]["id"], f"Удалена кнопка: {removed['text']}")
+                await self.send_message(message["chat"]["id"], f"Удалена кнопка: {html.escape(removed['text'])}")
         elif data == "confirm_broadcast":
             # Подтверждение отправки рассылки - запускаем в отдельной задаче чтобы не блокировать
             if self.broadcast_preview_data:
@@ -1036,7 +990,7 @@ class SimpleBot:
                 broadcast_data = dict(self.broadcast_preview_data)
                 broadcast_data["buttons"] = list(self.broadcast_buttons)
                 self.broadcast_preview_data = None
-                asyncio.create_task(self.execute_broadcast_async(message, broadcast_data))
+                self.spawn(self.execute_broadcast_async(message, broadcast_data))
                 # Сразу обновляем сообщение
                 try:
                     await self.send_message(
@@ -1056,8 +1010,13 @@ class SimpleBot:
                 {"inline_keyboard": [[{"text": "🔧 Админ панель", "callback_data": "back_to_main"}]]}
             )
         elif data == "back_to_main":
-            await self.edit_message(message["chat"]["id"], message["message_id"], 
-                                  "🔧 <b>Админ панель</b>\n\nВыберите действие:", 
+            self.reset_broadcast_draft()
+            for key in list(vars(self)):
+                if key.startswith('waiting_for_'):
+                    setattr(self, key, False)
+            self.editor_user_id = None
+            await self.edit_message(message["chat"]["id"], message["message_id"],
+                                  "🔧 <b>Админ панель</b>\n\nВыберите действие:",
                                   self.get_main_menu())
         elif data == "welcome_add":
             await self.start_add_welcome(message)
@@ -1144,130 +1103,80 @@ class SimpleBot:
         """Обработка новых участников канала"""
         if message["chat"]["id"] != self.channel_id:
             return
-        
+
         for member in message["new_chat_members"]:
             if not member.get("is_bot", False):
                 await self.send_welcome_to_user(member)
 
-    async def handle_user_start(self, message):
-        """Человек открыл диалог с ботом - теперь ему можно писать без ограничений."""
+    async def handle_user_start(self, message, first_time=None):
         user_id = message["from"]["id"]
-        first_time = user_id not in self.started_users
+        if message["chat"].get("type") != "private":
+            return
+        if first_time is None:
+            first_time = user_id not in self.started_users
+        self.register_private(user_id, restart=True)
+        if user_id in self.user_requests:
+            await self.approve_requests([self.user_requests[user_id]])
         if first_time:
-            self.started_users.add(user_id)
-            self.save_started_users()
-            logger.info(f"Диалог с ботом открыт: {user_id}")
-
-        pending_request = user_id in self.user_requests
-        if pending_request:
-            # Заявка ещё висит - одобряем сразу, человек своё условие выполнил.
-            approved = await self.approve_chat_join_request(self.channel_id, user_id)
-            if approved.get("ok"):
-                self.add_subscriber(user_id)
-                self._remove_request_safely(user_id)
-                logger.info(f"Заявка одобрена после нажатия кнопки: {user_id}")
-
-        if first_time:
-            # Ставим цепочку заново: до нажатия кнопки длинные приветствия
-            # обрезались, потому что доставить их было невозможно.
             await self.send_welcome_to_user({"id": user_id}, force=True)
-        else:
-            await self.send_message(
-                message["chat"]["id"],
-                "Доступ уже открыт 👌 Ждите сообщения от бота.",
-            )
+        await self.send_message(message["chat"]["id"],
+            "✅ Сообщения от бота включены. Они могут приходить и спустя неделю. "
+            "Чтобы отключить рассылки и отложенные сообщения, отправьте /stop.")
 
     async def send_welcome_to_user(self, user, force=False):
-        """Поставить всю цепочку приветствий в сохраняемую очередь."""
-        if not self.welcome_messages:
-            logger.info("Нет приветственных сообщений")
-            return 0
-
         user_id = user["id"]
-        if force:
-            # Убираем только длинные задачи этого человека, чтобы не
-            # продублировать их. Короткие приветствия, ещё не отправленные
-            # за время висящей заявки, оставляем как есть.
-            self.pending_welcome_jobs = [
-                job for job in self.pending_welcome_jobs
-                if job.get("user_id") != user_id
-                or max(0, int((job.get("welcome") or {}).get("delay", 0) or 0)) <= WELCOME_JOIN_WINDOW
-            ]
-            self.sent_welcomes.discard(user_id)
-        elif user_id in self.sent_welcomes or any(
-            job.get("user_id") == user_id and job.get("status", "pending") == "pending"
-            for job in self.pending_welcome_jobs
-        ):
-            logger.info(f"Цепочка приветствий для {user_id} уже создана")
+        if not self.may_deliver(user_id):
             return 0
-
-        active_messages = [msg for msg in self.welcome_messages if msg.get("active", False)]
-        if not active_messages:
-            if self.welcome_messages:
-                active_messages = [self.welcome_messages[0]]
-                logger.info(f"Используем первое неактивное приветствие для {user_id}")
-            else:
-                return 0
-
-        if force:
-            # Короткие приветствия человек уже получил, пока заявка висела.
-            # Заново ставим только длинные - те, что раньше было не доставить.
-            active_messages = [
-                msg for msg in active_messages
-                if max(0, int(msg.get("delay", 0) or 0)) > WELCOME_JOIN_WINDOW
-            ]
-            if not active_messages:
-                return 0
-
+        existing = [j for j in self.pending_welcome_jobs if j.get("user_id") == user_id]
+        if existing and not force:
+            return 0
+        state = self.recipient_state.get(str(user_id), {})
+        if (user_id in self.sent_welcomes or state.get("welcome_enrolled")) and not force:
+            return 0
+        active = sorted((m for m in self.welcome_messages if m.get("active", False)),
+                        key=lambda m: max(0, int(m.get("delay", 0) or 0)))
         now = time.time()
-        # Задержка каждого приветствия считается от момента заявки, а не
-        # складывается с предыдущими. Порядок отправки задаёт сама задержка.
-        active_messages = sorted(
-            active_messages,
-            key=lambda msg: max(0, int(msg.get("delay", 0) or 0)),
-        )
-        join_chat_id = user.get("join_chat_id") or user_id
-        # Человеку, не открывшему диалог с ботом, Telegram разрешает написать
-        # только пока заявка висит необработанной. Всё, что позже, обрезаем и
-        # вместо этого вешаем на первое приветствие кнопку-диплинк.
+        origin = min((j.get("created_at", now) for j in existing), default=user.get("request_time", now))
         gated = user_id not in self.started_users
+        delivered = set(state.get("welcome_delivered", []))
+        existing_keys = {j.get("welcome_key") for j in existing}
+        if force:
+            for job in existing:
+                job["chat_id"] = user_id
+                job["gate"] = False
+                if job.get("status") == "waiting_start":
+                    job["status"] = "pending"
+        queued = 0
         previous_due = None
-        skipped = 0
-        for i, welcome_msg in enumerate(active_messages):
-            due_at = now + max(0, int(welcome_msg.get("delay", 0) or 0))
-            # Приветствия с одинаковой задержкой разносим на секунду,
-            # чтобы не отправлять их в один момент.
-            if previous_due is not None and due_at <= previous_due:
-                due_at = previous_due + 1
-            if gated and due_at > now + WELCOME_JOIN_WINDOW:
-                skipped += 1
+        for index, welcome in enumerate(active):
+            key = welcome.get("id") or welcome.get("created_at") or str(index)
+            if key in delivered or key in existing_keys:
                 continue
-            previous_due = due_at
+            due = origin + max(0, int(welcome.get("delay", 0) or 0))
+            if previous_due is not None and due <= previous_due:
+                due = previous_due + 1.05
+            previous_due = due
+            waiting = gated and (due > origin + WELCOME_JOIN_WINDOW or not user.get("join_chat_id"))
             self.pending_welcome_jobs.append({
-                "id": uuid.uuid4().hex,
-                "user_id": user_id,
-                "chat_id": join_chat_id,
-                "due_at": due_at,
-                "created_at": now,
-                "sequence": i + 1,
-                "status": "pending",
-                "attempts": 0,
-                "last_error": "",
-                "schedule_v": WELCOME_SCHEDULE_VERSION,
-                "gate": gated and i == 0,
-                "welcome_key": welcome_msg.get("id") or welcome_msg.get("created_at"),
-                "welcome": copy.deepcopy(welcome_msg),
+                "id": uuid.uuid4().hex, "user_id": user_id,
+                "chat_id": user_id if not gated else user.get("join_chat_id", user_id),
+                "due_at": due, "created_at": origin, "sequence": index + 1,
+                "status": "waiting_start" if waiting else "pending", "attempts": 0,
+                "last_error": "", "schedule_v": WELCOME_SCHEDULE_VERSION,
+                "gate": gated and index == 0, "welcome_key": key,
+                "welcome": copy.deepcopy(welcome),
+                "join_expires_at": origin + WELCOME_JOIN_WINDOW if gated else None,
             })
-
-        queued = len(active_messages) - skipped
+            queued += 1
         self.save_pending_welcome_jobs()
-        if skipped:
-            logger.info(
-                f"В очередь добавлено {queued} приветствий для {user_id}; "
-                f"ещё {skipped} ждут нажатия кнопки (диалог с ботом не открыт)"
-            )
-        else:
-            logger.info(f"В очередь добавлено {queued} приветствий для {user_id}")
+        self.recipient(user_id, welcome_enrolled=True)
+        immediate_gate = any(j.get("user_id") == user_id and j.get("gate")
+                             and j.get("status") == "pending" and j.get("due_at", 0) <= now
+                             for j in self.pending_welcome_jobs)
+        if gated and not immediate_gate and user.get("join_chat_id") and now < origin + WELCOME_JOIN_WINDOW:
+            await self.send_message(user["join_chat_id"],
+                "Чтобы получать сообщения и после вступления в канал, нажмите кнопку и затем «Запустить». "
+                "Отключение сообщений: /stop.", self.gate_keyboard())
         await self.process_pending_welcome_jobs()
         return queued
 
@@ -1283,95 +1192,77 @@ class SimpleBot:
             await self.process_due_welcome_jobs()
 
     async def process_due_welcome_jobs(self):
-        """Один проход по созревшим задачам. Вызывать только под замком."""
         now = time.time()
-        changed = False
-        due_jobs = sorted(
-            (
-                job for job in self.pending_welcome_jobs
-                if job.get("status", "pending") == "pending" and float(job.get("due_at", 0)) <= now
-            ),
-            key=lambda job: (float(job.get("due_at", 0)), int(job.get("sequence", 0))),
-        )[:WELCOME_BATCH_LIMIT]
-        for index, job in enumerate(due_jobs):
-            # Не упираемся в лимит Telegram (~30 сообщений в секунду).
-            if index:
-                await asyncio.sleep(WELCOME_SEND_INTERVAL)
-            welcome = job["welcome"]
-            if job.get("welcome_key"):
-                welcome = next(
-                    (
-                        current for current in self.welcome_messages
-                        if (current.get("id") or current.get("created_at")) == job["welcome_key"]
-                    ),
-                    welcome,
-                )
-            # Если админ выключил ранее активное приветствие, не слать его из старой очереди.
-            if job["welcome"].get("active", False) and not welcome.get("active", False):
-                self.pending_welcome_jobs.remove(job)
-                changed = True
+        due_jobs = sorted((j for j in self.pending_welcome_jobs
+                           if j.get("status", "pending") == "pending" and float(j.get("due_at", 0)) <= now),
+                          key=lambda j: (j.get("due_at", 0), j.get("sequence", 0)))[:WELCOME_BATCH_LIMIT]
+        for job in due_jobs:
+            uid = job["user_id"]
+            if not self.may_deliver(uid):
+                job.update(status="cancelled", last_error="Отписка или блокировка")
+                self.save_pending_welcome_jobs()
                 continue
+            if uid in self.started_users:
+                job["chat_id"] = uid
+                job["gate"] = False
+            elif not job.get("join_expires_at") or now >= job["join_expires_at"] or uid not in self.user_requests:
+                job.update(status="waiting_start", last_error="Ожидается запуск бота пользователем")
+                self.save_pending_welcome_jobs()
+                continue
+            welcome = next((m for m in self.welcome_messages
+                            if (m.get("id") or m.get("created_at")) == job.get("welcome_key")), job["welcome"])
+            if not welcome.get("active", False):
+                job.update(status="cancelled", last_error="Приветствие выключено")
+                self.save_pending_welcome_jobs()
+                continue
+            job["status"] = "sending"
+            self.save_pending_welcome_jobs()
             result = await self.send_single_welcome(
-                {"id": job["user_id"], "chat_id": job.get("chat_id", job["user_id"])},
-                welcome,
-                extra_buttons=self.gate_keyboard() if job.get("gate") else None,
-            )
-            # Если временный chat_id заявки уже истёк, пробуем обычный user_id.
-            if not result.get("ok") and job.get("chat_id") != job["user_id"]:
-                result = await self.send_single_welcome(
-                    {"id": job["user_id"], "chat_id": job["user_id"]},
-                    welcome,
-                    extra_buttons=self.gate_keyboard() if job.get("gate") else None,
-                )
-
+                {"id": uid, "chat_id": job.get("chat_id", uid)}, welcome,
+                extra_buttons=self.gate_keyboard() if job.get("gate") else None)
             if result.get("ok"):
+                state = self.recipient_state.get(str(uid), {})
+                delivered = list(state.get("welcome_delivered", []))
+                if job.get("welcome_key") and job["welcome_key"] not in delivered:
+                    delivered.append(job["welcome_key"])
+                self.recipient(uid, welcome_delivered=delivered)
                 self.pending_welcome_jobs.remove(job)
-                changed = True
+                self.save_pending_welcome_jobs()
                 continue
-
             job["attempts"] = int(job.get("attempts", 0)) + 1
             job["last_error"] = self.telegram_error(result)
-            error_code = result.get("error_code")
-            if error_code in (400, 401, 403, 404) or job["attempts"] >= WELCOME_MAX_ATTEMPTS:
+            code = result.get("error_code", 0)
+            if result.get("delivery_unknown") or code == 0 or code >= 500:
+                job["status"] = "unknown"
+            elif code == 401:
+                job.update(status="pending", due_at=now + WELCOME_RETRY_SECONDS)
+            elif code == 403 and uid not in self.started_users:
+                job["status"] = "waiting_start"
+            elif code in (400, 403, 404) or job["attempts"] >= WELCOME_MAX_ATTEMPTS:
                 job["status"] = "failed"
+                if code == 403:
+                    self.recipient(uid, blocked=True)
             else:
-                job["due_at"] = now + WELCOME_RETRY_SECONDS * job["attempts"]
-            changed = True
-
-        if changed:
-            stale_before = now - WELCOME_FAILED_TTL
-            self.pending_welcome_jobs = [
-                job for job in self.pending_welcome_jobs
-                if job.get("status") != "failed"
-                or float(job.get("created_at", now)) >= stale_before
-            ]
-            active_user_ids = {
-                job.get("user_id") for job in self.pending_welcome_jobs
-                if job.get("status") == "pending"
-            }
-            delivered_user_ids = {
-                job["user_id"] for job in due_jobs
-                if job.get("user_id") not in active_user_ids and job not in self.pending_welcome_jobs
-            }
-            self.sent_welcomes.update(delivered_user_ids)
+                delay = result.get("parameters", {}).get("retry_after", WELCOME_RETRY_SECONDS)
+                job.update(status="pending", due_at=time.time() + max(1, float(delay)))
             self.save_pending_welcome_jobs()
 
     async def send_single_welcome(self, user, welcome_msg, extra_buttons=None):
         """Отправить одно приветственное сообщение"""
         chat_id = user.get("chat_id", user["id"])
-        
+
         # Создаем URL кнопки если есть
         reply_markup = None
         if welcome_msg.get("url_buttons"):
             keyboard = []
             for button in welcome_msg["url_buttons"]:
-                keyboard.append([{"text": button["text"], "url": button["url"]}])
+                keyboard.append([copy.deepcopy(button)])
             reply_markup = {"inline_keyboard": keyboard}
         if extra_buttons:
             keyboard = list(reply_markup["inline_keyboard"]) if reply_markup else []
             keyboard.extend(extra_buttons["inline_keyboard"])
             reply_markup = {"inline_keyboard": keyboard}
-        
+
         # Отправляем сообщение в зависимости от типа
         try:
             if welcome_msg["type"] == "text":
@@ -1407,7 +1298,7 @@ class SimpleBot:
             return result
         except Exception as e:
             logger.error(f"Ошибка отправки приветствия пользователю {user['id']}: {e}")
-            return {"ok": False, "description": str(e)}
+            return {"ok": False, "error_code": 0, "description": type(e).__name__, "delivery_unknown": True}
 
     async def send_message_with_markup(self, chat_id, text, reply_markup=None, entities=None):
         """Отправить сообщение с разметкой"""
@@ -1503,16 +1394,16 @@ class SimpleBot:
     async def show_welcome_menu(self, message):
         """Показать меню приветствий"""
         text = "📝 <b>Управление приветствиями</b>\n\n"
-        
+
         keyboard_buttons = []
-        
+
         if self.welcome_messages:
             text += "Выберите приветствие для редактирования:\n\n"
             for i, msg in enumerate(self.welcome_messages):
                 delay_text = f" (⏱️ {self.format_delay(msg.get('delay', 0))})"
                 type_emoji = "📝" if msg['type'] == 'text' else "📷" if msg['type'] == 'photo' else "📄"
                 preview = msg['text'][:30] if msg['text'] else f"{msg['type'].upper()}"
-                
+
                 keyboard_buttons.append([{"text": f"{type_emoji} {i+1}. {preview}...{delay_text}", "callback_data": f"welcome_edit_{i}"}])
         else:
             text += "Приветственные сообщения не настроены.\n"
@@ -1524,9 +1415,9 @@ class SimpleBot:
             [{"text": f"⏳ Очередь: {waiting_count}  ⚠️ {failed_count}", "callback_data": "welcome_queue"}],
             [{"text": "⬅️ Назад", "callback_data": "back_to_main"}]
         ])
-        
+
         keyboard = {"inline_keyboard": keyboard_buttons}
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def show_welcome_queue(self, message):
@@ -1537,6 +1428,8 @@ class SimpleBot:
         text += f"Ожидают отправки: <b>{len(pending)}</b>\n"
         text += f"Не доставлены: <b>{len(failed)}</b>\n"
         text += f"Открыли диалог с ботом: <b>{len(self.started_users)}</b>\n"
+        text += f"Ждут запуска бота: <b>{sum(j.get('status') == 'waiting_start' for j in self.pending_welcome_jobs)}</b>\n"
+        text += f"Неизвестный результат (без автоповтора): <b>{sum(j.get('status') == 'unknown' for j in self.pending_welcome_jobs)}</b>\n"
         if pending:
             next_job = min(pending, key=lambda job: float(job.get("due_at", 0)))
             next_time = datetime.fromtimestamp(
@@ -1584,7 +1477,7 @@ class SimpleBot:
         text += f"Автоприем: {'✅ Включен' if self.auto_accept else '❌ Выключен'}\n"
         if self.auto_accept:
             text += f"Задержка: {self.auto_delay} секунд\n"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "🤖 Автоприем", "callback_data": "accept_auto"}],
@@ -1593,7 +1486,7 @@ class SimpleBot:
                 [{"text": "⬅️ Назад", "callback_data": "back_to_main"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def show_settings_menu(self, message):
@@ -1601,7 +1494,7 @@ class SimpleBot:
         text = "⚙️ <b>Настройки</b>\n\n"
         text += f"Админов: 1\n"
         text += f"Канал: {self.channel_id}\n"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "👥 Админы", "callback_data": "settings_admins"}],
@@ -1610,7 +1503,7 @@ class SimpleBot:
                 [{"text": "⬅️ Назад", "callback_data": "back_to_main"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def show_statistics(self, message):
@@ -1620,13 +1513,13 @@ class SimpleBot:
         text += f"Всего пользователей: {len(self.subscribers)}\n"
         text += f"Подписок сегодня: {today_count}\n"
         text += f"Подписок за неделю: {week_count}\n"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "⬅️ Назад", "callback_data": "back_to_main"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def show_broadcast_menu(self, message):
@@ -1648,7 +1541,12 @@ class SimpleBot:
         await self.edit_message(
             message["chat"]["id"], message["message_id"],
             f"📢 <b>Рассылки</b>\n\n{schedule_text}\n\n"
-            "Создайте новую рассылку, затем в предпросмотре выберите «Отправлять каждый день».",
+            f"Доступных личных диалогов: <b>{len(self.broadcast_targets())}</b>\n"
+            f"Исторических подписчиков без подтверждённого диалога: <b>{len(self.subscribers - self.started_users)}</b>\n\n"
+            "Рассылка приходит и спустя неделю тем, кто написал боту или нажал «Запустить» и не отписался. "
+            "Вступления в канал недостаточно. Отключение: /stop.\n"
+            "Создайте рассылку; ежедневный режим включается в предпросмотре.\n"
+            + html.escape(self.ui_notice),
             {"inline_keyboard": keyboard},
         )
 
@@ -1674,7 +1572,7 @@ class SimpleBot:
                 if index == len(items) - 1:
                     preview_id = result["result"]["message_id"]
             self.broadcast_preview_message_id = preview_id
-            recipients = len(self.subscribers) if self.subscribers else len(self.admin_ids)
+            recipients = len(self.broadcast_targets())
             await self.send_message(
                 chat_id,
                 f"📢 <b>Предпросмотр готов</b>\n"
@@ -1695,108 +1593,13 @@ class SimpleBot:
         self.broadcast_preview_data = None
         await self.execute_broadcast_async(message, broadcast_data)
 
-    async def execute_broadcast_async(self, message, data):
-        """Разослать исходные сообщения через copyMessage с одной клавиатурой."""
-        targets = list(self.subscribers) if self.subscribers else self.admin_ids
-        chat_id = message["chat"]["id"]
-        items = data.get("items", [])
-        if not items:
-            await self.send_message(chat_id, "❌ В черновике нет сообщений.")
-            return
-
-        logger.info(f"Рассылка: сообщений {len(items)}, получателей {len(targets)}")
-        try:
-            status_msg = await self.send_message(
-                chat_id,
-                f"📤 Отправка рассылки {len(targets)} получателям...\n\n⏳ Это может занять несколько минут."
-            )
-            status_message_id = None
-            if status_msg and status_msg.get('ok'):
-                status_message_id = status_msg['result']['message_id']
-        except Exception as e:
-            logger.error(f"Ошибка отправки статуса: {e}")
-            status_message_id = None
-        
-        success_count = 0
-        fail_count = 0
-        blocked_users = []
-        
-        try:
-            for idx, uid in enumerate(targets):
-                try:
-                    for item_index, item in enumerate(items):
-                        markup = None
-                        if item_index == len(items) - 1 and data.get("buttons"):
-                            markup = {"inline_keyboard": [
-                                [{"text": button["text"], "url": button["url"]}]
-                                for button in data["buttons"]
-                            ]}
-                        result = await self.copy_message(
-                            uid, item["from_chat_id"], item["message_id"], markup
-                        )
-                        error = self.telegram_error(result)
-                        if error:
-                            raise RuntimeError(error)
-                    success_count += 1
-                    await asyncio.sleep(0.05)
-                    
-                    # Обновляем статус каждые 100 отправок
-                    if status_message_id and (idx + 1) % 100 == 0:
-                        try:
-                            await self.edit_message(
-                                chat_id,
-                                status_message_id,
-                                f"📤 Отправка рассылки...\n\n✅ Отправлено: {success_count}\n❌ Ошибок: {fail_count}\n📊 Прогресс: {idx + 1}/{len(targets)}"
-                            )
-                        except Exception:
-                            pass
-                except Exception as e:
-                    error_str = str(e)
-                    # Если пользователь заблокировал бота - запоминаем для удаления
-                    if 'blocked' in error_str.lower() or 'deactivated' in error_str.lower() or 'chat not found' in error_str.lower():
-                        blocked_users.append(uid)
-                    logger.error(f"Ошибка отправки пользователю {uid}: {e}")
-                    fail_count += 1
-            
-            # Удаляем заблокировавших из базы
-            if blocked_users:
-                for uid in blocked_users:
-                    self.subscribers.discard(uid)
-                    self.subscriber_dates.pop(str(uid), None)
-                self.save_subscribers()
-                self.save_subscriber_dates()
-                logger.info(f"Удалено заблокировавших: {len(blocked_users)}")
-            
-            # Отчет о рассылке
-            result_text = f"✅ <b>Рассылка завершена!</b>\n\n"
-            result_text += f"📤 Отправлено: {success_count}\n"
-            if fail_count > 0:
-                result_text += f"❌ Ошибок: {fail_count}\n"
-            if blocked_users:
-                result_text += f"🚫 Удалено заблокировавших: {len(blocked_users)}\n"
-            
-            keyboard = {
-                "inline_keyboard": [
-                    [{"text": "🔧 Админ панель", "callback_data": "back_to_main"}]
-                ]
-            }
-            
-            # Отправляем финальный отчет новым сообщением
-            await self.send_message(chat_id, result_text, keyboard)
-            logger.info(f"=== Рассылка завершена: {success_count} успешно, {fail_count} ошибок ===")
-            
-        except Exception as e:
-            logger.error(f"Ошибка выполнения рассылки: {e}", exc_info=True)
-            await self.send_message(
-                chat_id,
-                f"❌ Ошибка рассылки: {e}\n\n📤 Отправлено до ошибки: {success_count}",
-                {"inline_keyboard": [[{"text": "🔧 Админ панель", "callback_data": "back_to_main"}]]}
-            )
+    async def execute_broadcast_async(self, message, data, job_id=None):
+        return await super().execute_broadcast_async(message, data, job_id)
 
     async def show_welcome_list(self, message):
         """Показать список приветствий"""
         text = "📋 <b>Все приветственные сообщения</b>\n\n"
-        
+
         if not self.welcome_messages:
             text += "Приветственные сообщения не найдены."
         else:
@@ -1804,26 +1607,26 @@ class SimpleBot:
                 delay_text = f" (задержка: {msg.get('delay', 0)}с)" if msg.get('delay', 0) > 0 else ""
                 text += f"✅ <b>ID{i+1}</b>{delay_text}\n"
                 text += f"<i>{msg['text'][:100]}{'...' if len(msg['text']) > 100 else ''}</i>\n\n"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "⬅️ Назад", "callback_data": "welcome_menu"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def start_add_welcome(self, message):
         """Начать добавление приветствия"""
         self.waiting_for_welcome_text = True
         text = "📝 <b>Добавление приветствия</b>\n\nОтправьте текст, фото, документ или видео для приветствия:"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "❌ Отмена", "callback_data": "welcome_menu"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def show_auto_accept_menu(self, message):
@@ -1832,7 +1635,7 @@ class SimpleBot:
         text += f"Статус: {'✅ Включен' if self.auto_accept else '❌ Выключен'}\n"
         text += f"Задержка: {self.auto_delay} секунд\n\n"
         text += "Выберите действие:"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "❌ Выключить" if self.auto_accept else "✅ Включить", "callback_data": "auto_accept_toggle"}],
@@ -1840,7 +1643,7 @@ class SimpleBot:
                 [{"text": "⬅️ Назад", "callback_data": "accept_menu"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def show_manual_accept_menu(self, message):
@@ -1848,7 +1651,7 @@ class SimpleBot:
         text = f"✋ <b>Ручной прием</b>\n\n"
         text += f"В очереди: {len(self.pending_requests)} пользователей\n\n"
         text += "Выберите действие:"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "📊 Количество", "callback_data": "manual_accept_count"}],
@@ -1858,30 +1661,30 @@ class SimpleBot:
                 [{"text": "⬅️ Назад", "callback_data": "accept_menu"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def show_schedule_accept_menu(self, message):
         """Показать меню приема по расписанию"""
         text = f"⏰ <b>Прием по расписанию</b>\n\n"
-        
+
         if self.schedules:
             # Показываем все настроенные расписания
             text += f"✅ <b>Настроенные расписания:</b>\n\n"
-            
+
             days_names = ["Воскресенье", "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
-            
+
             for day_data, schedule in self.schedules.items():
                 if day_data == "daily":
                     day_name = "Ежедневно"
                 else:
                     day_name = days_names[int(day_data)]
-                
+
                 status_icon = "🟢" if schedule.get("active", False) else "🔴"
                 text += f"{status_icon} <b>{day_name}</b> - {schedule['time']} ({'Все' if schedule['count'] == 'all' else schedule['count']})\n"
-            
+
             text += "\nВыберите действие:"
-            
+
             keyboard = {
                 "inline_keyboard": [
                     [{"text": "➕ Добавить день", "callback_data": "schedule_add_day"}],
@@ -1893,7 +1696,7 @@ class SimpleBot:
         else:
             text += "Расписание не настроено\n"
             text += "\nВыберите день недели:"
-            
+
             keyboard = {
                 "inline_keyboard": [
                     [{"text": "Понедельник", "callback_data": "schedule_day_1"}, {"text": "Вторник", "callback_data": "schedule_day_2"}],
@@ -1904,14 +1707,14 @@ class SimpleBot:
                     [{"text": "⬅️ Назад", "callback_data": "accept_menu"}]
                 ]
             }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def show_schedule_edit_menu(self, message):
         """Показать меню редактирования расписания"""
         text = f"✏️ <b>Редактирование расписания</b>\n\n"
         text += "Выберите день для редактирования:"
-        
+
         if not self.schedules:
             text += "\n❌ Нет настроенных расписаний"
             keyboard = {
@@ -1922,21 +1725,21 @@ class SimpleBot:
         else:
             days_names = ["Воскресенье", "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
             keyboard_buttons = []
-            
+
             for day_data, schedule in self.schedules.items():
                 if day_data == "daily":
                     day_name = "Ежедневно"
                 else:
                     day_name = days_names[int(day_data)]
-                
+
                 status_icon = "🟢" if schedule.get("active", False) else "🔴"
                 button_text = f"{status_icon} {day_name} ({schedule['time']})"
                 keyboard_buttons.append([{"text": button_text, "callback_data": f"schedule_edit_day_{day_data}"}])
-            
+
             keyboard_buttons.append([{"text": "⬅️ Назад", "callback_data": "schedule_accept"}])
-            
+
             keyboard = {"inline_keyboard": keyboard_buttons}
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def toggle_schedule(self, message):
@@ -1963,7 +1766,7 @@ class SimpleBot:
         """Показать меню выбора дня недели для добавления расписания"""
         text = f"📅 <b>Добавить день в расписание</b>\n\n"
         text += "Выберите день недели:"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "Понедельник", "callback_data": "schedule_day_1"}, {"text": "Вторник", "callback_data": "schedule_day_2"}],
@@ -1974,28 +1777,28 @@ class SimpleBot:
                 [{"text": "⬅️ Назад", "callback_data": "schedule_accept"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def handle_schedule_edit_day(self, message, data):
         """Обработка редактирования конкретного дня расписания"""
         day_data = data.replace("schedule_edit_day_", "")
-        
+
         if day_data not in self.schedules:
             await self.send_message(message["chat"]["id"], "❌ Расписание для этого дня не найдено")
             return
-        
+
         schedule = self.schedules[day_data]
         days_names = ["Воскресенье", "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
         day_name = "Ежедневно" if day_data == "daily" else days_names[int(day_data)]
-        
+
         text = f"✏️ <b>Редактирование расписания</b>\n\n"
         text += f"День: {day_name}\n"
         text += f"Время: {schedule['time']}\n"
         text += f"Количество: {'Все' if schedule['count'] == 'all' else schedule['count']}\n"
         text += f"Статус: {'🟢 Активно' if schedule.get('active', False) else '🔴 Выключено'}\n\n"
         text += "Выберите действие:"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "✏️ Изменить время", "callback_data": f"schedule_edit_time_{day_data}"}],
@@ -2005,7 +1808,7 @@ class SimpleBot:
                 [{"text": "⬅️ Назад", "callback_data": "schedule_edit"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def handle_schedule_edit_time(self, message, data):
@@ -2013,21 +1816,21 @@ class SimpleBot:
         day_data = data.replace("schedule_edit_time_", "")
         self.waiting_for_schedule_time = True
         self.current_schedule_data = {"day": day_data, "count": self.schedules[day_data]["count"]}
-        
+
         days_names = ["Воскресенье", "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
         day_name = "Ежедневно" if day_data == "daily" else days_names[int(day_data)]
-        
+
         text = f"✏️ <b>Изменение времени</b>\n\n"
         text += f"День: {day_name}\n"
         text += f"Текущее время: {self.schedules[day_data]['time']}\n\n"
         text += "Введите новое время в формате ЧЧ:ММ (например, 14:30):"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "❌ Отмена", "callback_data": f"schedule_edit_day_{day_data}"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def handle_schedule_edit_count(self, message, data):
@@ -2035,15 +1838,15 @@ class SimpleBot:
         day_data = data.replace("schedule_edit_count_", "")
         self.waiting_for_schedule_count = True
         self.current_schedule_data = {"day": day_data}
-        
+
         days_names = ["Воскресенье", "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
         day_name = "Ежедневно" if day_data == "daily" else days_names[int(day_data)]
-        
+
         text = f"✏️ <b>Изменение количества</b>\n\n"
         text += f"День: {day_name}\n"
         text += f"Текущее количество: {'Все' if self.schedules[day_data]['count'] == 'all' else self.schedules[day_data]['count']}\n\n"
         text += "Выберите новое количество:"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "1", "callback_data": f"schedule_count_1_{day_data}"}, {"text": "5", "callback_data": f"schedule_count_5_{day_data}"}],
@@ -2053,7 +1856,7 @@ class SimpleBot:
                 [{"text": "❌ Отмена", "callback_data": f"schedule_edit_day_{day_data}"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def handle_schedule_toggle_day(self, message, data):
@@ -2085,13 +1888,13 @@ class SimpleBot:
         text += "• Часы: 1ч, 2ч, 24ч\n"
         text += "• Комбинированный: 1ч 30м, 2ч 15м 30с\n\n"
         text += "Примеры: 30, 2м, 1ч, 1ч 30м"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "❌ Отмена", "callback_data": "auto_accept_delay"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def handle_delay_input(self, message, delay_text):
@@ -2101,18 +1904,18 @@ class SimpleBot:
             if delay_seconds is None:
                 await self.send_message(message["chat"]["id"], "❌ Неверный формат задержки. Попробуйте еще раз.")
                 return
-            
+
             if delay_seconds < 0:
                 await self.send_message(message["chat"]["id"], "❌ Задержка не может быть отрицательной.")
                 return
-            
+
             if delay_seconds > 86400:  # 24 часа
                 await self.send_message(message["chat"]["id"], "❌ Максимальная задержка: 24 часа.")
                 return
-            
+
             self.auto_delay = delay_seconds
             self.save_settings()
-            
+
             # Форматируем время для отображения
             if delay_seconds < 60:
                 delay_display = f"{delay_seconds} секунд"
@@ -2124,31 +1927,15 @@ class SimpleBot:
                 hours = delay_seconds // 3600
                 minutes = (delay_seconds % 3600) // 60
                 delay_display = f"{hours}ч {minutes}м" if minutes > 0 else f"{hours} часов"
-            
+
             await self.send_message(message["chat"]["id"], f"✅ Задержка установлена: {delay_display}")
             await self.show_delay_menu(message)
-            
+
         except Exception as e:
             await self.send_message(message["chat"]["id"], "❌ Ошибка при обработке задержки. Попробуйте еще раз.")
 
     def parse_custom_delay(self, delay_text):
-        """Парсинг пользовательского ввода задержки"""
-        try:
-            delay_text = delay_text.strip().lower()
-            if re.fullmatch(r'\d+', delay_text):
-                return int(delay_text)
-
-            # Принимаем как одиночные, так и комбинированные единицы.
-            if not re.fullmatch(r'(?:\d+\s*[дчмс]\s*)+', delay_text):
-                return None
-            multipliers = {'д': 86400, 'ч': 3600, 'м': 60, 'с': 1}
-            total_seconds = sum(
-                int(value) * multipliers[unit]
-                for value, unit in re.findall(r'(\d+)\s*([дчмс])', delay_text)
-            )
-            return total_seconds
-        except (TypeError, ValueError):
-            return None
+        return parse_duration(delay_text)
 
     async def start_welcome_delay_input(self, message, data):
         """Начать ввод задержки для приветствия"""
@@ -2163,7 +1950,7 @@ class SimpleBot:
         self.waiting_for_welcome_delay = True
         self.current_welcome_delay_id = welcome_id
         logger.info(f"Установлено waiting_for_welcome_delay=True, current_welcome_delay_id={welcome_id}")
-        
+
         text = "⏱️ <b>Ввод задержки приветствия</b>\n\n"
         text += "Введите задержку в одном из форматов:\n"
         text += "• Секунды: 30, 60, 120\n"
@@ -2171,14 +1958,14 @@ class SimpleBot:
         text += "• Часы: 1ч, 24ч, 48ч\n"
         text += "• Дни: 2д, 7д, 30д\n"
         text += "• Комбинированный: 1д 12ч, 2д 15м 30с\n\n"
-        text += "⚠️ После 24 часов доставка в личку надёжна только если пользователь уже запускал бота."
-        
+        text += "Для отложенных сообщений человек должен запустить бота. Заявка в канал даёт только до 5 минут связи до её обработки."
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "❌ Отмена", "callback_data": f"welcome_delay_{welcome_id}"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def handle_welcome_delay_input(self, message, delay_text):
@@ -2188,22 +1975,22 @@ class SimpleBot:
             if delay_seconds is None:
                 await self.send_message(message["chat"]["id"], "❌ Неверный формат задержки. Попробуйте еще раз.")
                 return
-            
+
             if delay_seconds < 0:
                 await self.send_message(message["chat"]["id"], "❌ Задержка не может быть отрицательной.")
                 return
-            
+
             if delay_seconds > MAX_WELCOME_DELAY_SECONDS:
                 await self.send_message(message["chat"]["id"], "❌ Максимальная задержка для приветствий: 30 дней.")
                 return
-            
+
             welcome_id = self.current_welcome_delay_id
             if welcome_id is not None and welcome_id < len(self.welcome_messages):
                 self.welcome_messages[welcome_id]["delay"] = delay_seconds
                 self.save_welcome_messages()
                 self.waiting_for_welcome_delay = False
                 self.current_welcome_delay_id = None
-                
+
                 # Форматируем время для отображения
                 if delay_seconds < 60:
                     delay_display = f"{delay_seconds} секунд"
@@ -2215,12 +2002,12 @@ class SimpleBot:
                     hours = delay_seconds // 3600
                     minutes = (delay_seconds % 3600) // 60
                     delay_display = f"{hours}ч {minutes}м" if minutes > 0 else f"{hours} часов"
-                
+
                 await self.send_message(message["chat"]["id"], f"✅ Задержка приветствия установлена: {delay_display}")
                 await self.show_welcome_delay_menu(message, f"welcome_delay_{welcome_id}")
             else:
                 await self.send_message(message["chat"]["id"], "❌ Приветствие не найдено.")
-            
+
         except Exception as e:
             await self.send_message(message["chat"]["id"], "❌ Ошибка при обработке задержки. Попробуйте еще раз.")
 
@@ -2229,7 +2016,7 @@ class SimpleBot:
         text = "👥 <b>Управление админами</b>\n\n"
         text += f"• Админы: {', '.join([f'@{admin_id}' for admin_id in self.admin_ids])}\n"
         text += "\nВыберите действие:"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "➕ Добавить админа", "callback_data": "admin_add"}],
@@ -2237,7 +2024,7 @@ class SimpleBot:
                 [{"text": "⬅️ Назад", "callback_data": "settings_menu"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def show_channel_settings(self, message):
@@ -2246,13 +2033,13 @@ class SimpleBot:
         text += f"ID канала: <code>{self.channel_id}</code>\n"
         text += f"Текущий канал: {self.channel_id}\n\n"
         text += "Для смены канала обратитесь к разработчику."
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "⬅️ Назад", "callback_data": "settings_menu"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def show_token_settings(self, message):
@@ -2260,13 +2047,13 @@ class SimpleBot:
         text = "🔑 <b>Настройки токена</b>\n\n"
         text += "Токен бота скрыт для безопасности.\n"
         text += "Для смены токена обратитесь к разработчику."
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "⬅️ Назад", "callback_data": "settings_menu"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def toggle_auto_accept(self, message):
@@ -2278,7 +2065,7 @@ class SimpleBot:
     async def show_delay_menu(self, message):
         """Показать меню задержки"""
         text = "⏱️ <b>Выберите задержку</b>"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "30 секунд", "callback_data": "delay_30"}, {"text": "1 минута", "callback_data": "delay_60"}],
@@ -2289,76 +2076,51 @@ class SimpleBot:
                 [{"text": "⬅️ Назад", "callback_data": "accept_menu"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def accept_all_users(self, message):
-        """Принять всех пользователей"""
-        if not self.pending_requests:
-            text = "❌ В очереди нет заявок."
-        else:
-            # Принимаем всех пользователей
-            accepted_count = 0
-            for req in self.pending_requests:
-                try:
-                    await self.approve_chat_join_request(self.channel_id, req["user_id"])
-                    # Добавляем в подписчики
-                    self.add_subscriber(req["user_id"])
-                    # Приветствие уже отправлено при подаче заявки
-                    accepted_count += 1
-                except Exception as e:
-                    logger.error(f"Ошибка приема пользователя {req['user_id']}: {e}")
-            
-            # Очищаем все списки заявок
-            self.pending_requests = []
-            self.user_requests = {}
-            self.sent_welcomes = set()
-            text = f"✅ Принято {accepted_count} пользователей."
-        
-        keyboard = {
-            "inline_keyboard": [
-                [{"text": "⬅️ Назад", "callback_data": "accept_menu"}]
-            ]
-        }
-        
-        await self.show_screen(message, text, keyboard)
+        accepted = await self.approve_requests(self.pending_requests)
+        await self.show_screen(message, f"✅ Принято: {accepted}. Осталось в очереди: {len(self.pending_requests)}.",
+            {"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "accept_menu"}]]})
 
     async def start_manual_accept_count(self, message):
         """Начать ручной прием по количеству"""
+        self.waiting_for_manual_count = True
         text = "📊 <b>Прием по количеству</b>\n\nВведите количество пользователей для приема:"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "❌ Отмена", "callback_data": "accept_menu"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def start_manual_accept_date(self, message):
         """Начать ручной прием по дате"""
         self.waiting_for_date = True
         text = "📅 <b>Прием по дате</b>\n\nВведите дату в формате ДД.ММ.ГГГГ (например, 15.12.2024):"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "❌ Отмена", "callback_data": "accept_menu"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def start_manual_accept_link(self, message):
         """Начать ручной прием по ссылке"""
         self.waiting_for_link = True
         text = "🔗 <b>Прием по ссылке</b>\n\nВведите ссылку-приглашение (например, https://t.me/+ABC123):"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "❌ Отмена", "callback_data": "accept_menu"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def handle_date_input(self, message, date_text):
@@ -2367,20 +2129,20 @@ class SimpleBot:
             from datetime import datetime
             # Парсим дату в формате ДД.ММ.ГГГГ
             parsed_date = datetime.strptime(date_text, "%d.%m.%Y").strftime("%d.%m.%Y")
-            
+
             # Находим заявки с этой датой
             matching_requests = [req for req in self.pending_requests if req["date"] == parsed_date]
-            
+
             if not matching_requests:
                 await self.send_message(message["chat"]["id"], f"❌ Заявок на дату {parsed_date} не найдено.")
                 return
-            
+
             # Показываем количество и предлагаем выбор
             text = f"📅 <b>Прием по дате</b>\n\n"
             text += f"Дата: {parsed_date}\n"
             text += f"Найдено заявок: {len(matching_requests)}\n\n"
             text += "Выберите действие:"
-            
+
             keyboard = {
                 "inline_keyboard": [
                     [{"text": f"✅ Принять всех ({len(matching_requests)})", "callback_data": f"date_accept_all_{parsed_date}"}],
@@ -2388,101 +2150,48 @@ class SimpleBot:
                     [{"text": "❌ Отмена", "callback_data": "accept_menu"}]
                 ]
             }
-            
+
             await self.send_message(message["chat"]["id"], text, keyboard)
-            
+
         except ValueError:
             await self.send_message(message["chat"]["id"], "❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ (например, 15.12.2024)")
 
     async def handle_link_input(self, message, link_text):
-        """Обработка ввода ссылки для ручного приема"""
-        # Находим заявки с этой ссылкой
-        matching_requests = [req for req in self.pending_requests if req["invite_link"] == link_text]
-        
-        if not matching_requests:
-            await self.send_message(message["chat"]["id"], f"❌ Заявок по ссылке {link_text} не найдено.")
-            return
-        
-        # Принимаем всех с этой ссылкой
-        accepted_count = 0
-        for req in matching_requests:
-            try:
-                await self.approve_chat_join_request(self.channel_id, req["user_id"])
-                # Добавляем в подписчики
-                self.add_subscriber(req["user_id"])
-                await self.send_welcome_to_user({"id": req["user_id"]})
-                accepted_count += 1
-            except Exception as e:
-                logger.error(f"Ошибка приема пользователя {req['user_id']}: {e}")
-        
-        # Удаляем принятых из всех списков
-        self.pending_requests = [req for req in self.pending_requests if req["invite_link"] != link_text]
-        for req in matching_requests:
-            if req["user_id"] in self.user_requests:
-                del self.user_requests[req["user_id"]]
-            if req["user_id"] in self.sent_welcomes:
-                self.sent_welcomes.remove(req["user_id"])
-        
-        await self.send_message(message["chat"]["id"], f"✅ Принято {accepted_count} пользователей по ссылке {link_text}")
+        matching = [r for r in self.pending_requests if r.get("invite_link") == link_text.strip()]
+        accepted = await self.approve_requests(matching)
+        await self.send_message(message["chat"]["id"], f"✅ Принято по ссылке: {accepted}. Ошибочные заявки остаются в очереди.")
 
     async def handle_date_accept_all(self, message, data):
-        """Принять всех пользователей с указанной даты"""
         date_str = data.replace("date_accept_all_", "")
-        
-        # Находим заявки с этой датой
-        matching_requests = [req for req in self.pending_requests if req["date"] == date_str]
-        
-        if not matching_requests:
-            await self.send_message(message["chat"]["id"], f"❌ Заявок на дату {date_str} не найдено.")
-            return
-        
-        # Принимаем всех с этой датой
-        accepted_count = 0
-        for req in matching_requests:
-            try:
-                await self.approve_chat_join_request(self.channel_id, req["user_id"])
-                # Добавляем в подписчики
-                self.add_subscriber(req["user_id"])
-                await self.send_welcome_to_user({"id": req["user_id"]})
-                accepted_count += 1
-            except Exception as e:
-                logger.error(f"Ошибка приема пользователя {req['user_id']}: {e}")
-        
-        # Удаляем принятых из всех списков
-        self.pending_requests = [req for req in self.pending_requests if req["date"] != date_str]
-        for req in matching_requests:
-            if req["user_id"] in self.user_requests:
-                del self.user_requests[req["user_id"]]
-            if req["user_id"] in self.sent_welcomes:
-                self.sent_welcomes.remove(req["user_id"])
-        
-        await self.send_message(message["chat"]["id"], f"✅ Принято {accepted_count} пользователей с даты {date_str}")
+        matching = [r for r in self.pending_requests if r.get("date") == date_str]
+        accepted = await self.approve_requests(matching)
+        await self.send_message(message["chat"]["id"], f"✅ Принято за {html.escape(date_str)}: {accepted}. Ошибочные заявки остаются в очереди.")
 
     async def handle_date_accept_custom(self, message, data):
         """Начать ввод количества для приема по дате"""
         date_str = data.replace("date_accept_custom_", "")
-        
+
         # Находим заявки с этой датой
         matching_requests = [req for req in self.pending_requests if req["date"] == date_str]
-        
+
         if not matching_requests:
             await self.send_message(message["chat"]["id"], f"❌ Заявок на дату {date_str} не найдено.")
             return
-        
+
         self.waiting_for_date_count = True
         self.current_schedule_data = {"date": date_str, "max_count": len(matching_requests)}
-        
+
         text = f"📅 <b>Прием по дате</b>\n\n"
         text += f"Дата: {date_str}\n"
         text += f"Доступно заявок: {len(matching_requests)}\n\n"
         text += f"Введите количество людей для приема (от 1 до {len(matching_requests)}):"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "❌ Отмена", "callback_data": "accept_menu"}]
             ]
         }
-        
+
         await self.send_message(message["chat"]["id"], text, keyboard)
 
     async def handle_schedule_count_input(self, message, count_text):
@@ -2492,75 +2201,50 @@ class SimpleBot:
             if count <= 0:
                 await self.send_message(message["chat"]["id"], "❌ Количество должно быть больше 0.")
                 return
-            
+
             # Убираем проверку на текущее количество заявок
             # Заявки могут накопиться к моменту выполнения расписания
-            
+
             # Сохраняем количество и активируем ожидание времени
             self.current_schedule_data["count"] = count
             self.waiting_for_schedule_time = True
-            
+
             if self.current_schedule_data["day"] == "daily":
                 day_name = "Ежедневно"
             else:
                 days = ["Воскресенье", "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
                 day_name = days[int(self.current_schedule_data["day"])]
-            
+
             text = f"⏰ <b>Прием по расписанию</b>\n\n"
             text += f"День: {day_name}\n"
             text += f"Количество: {count}\n"
             text += f"В очереди: {len(self.pending_requests)} пользователей\n\n"
             text += "Введите время в формате ЧЧ:ММ (например, 14:30):"
-            
+
             keyboard = {
                 "inline_keyboard": [
                     [{"text": "❌ Отмена", "callback_data": "accept_menu"}]
                 ]
             }
-            
+
             await self.send_message(message["chat"]["id"], text, keyboard)
-            
+
         except ValueError:
             await self.send_message(message["chat"]["id"], "❌ Введите корректное число.")
 
     async def handle_date_count_input(self, message, count_text):
-        """Обработка ввода количества для приема по дате"""
         try:
             count = int(count_text)
-            max_count = self.current_schedule_data["max_count"]
-            date_str = self.current_schedule_data["date"]
-            
-            if count <= 0 or count > max_count:
-                await self.send_message(message["chat"]["id"], f"❌ Количество должно быть от 1 до {max_count}.")
-                return
-            
-            # Находим заявки с этой датой
-            matching_requests = [req for req in self.pending_requests if req["date"] == date_str]
-            
-            # Принимаем указанное количество
-            accepted_count = 0
-            for i, req in enumerate(matching_requests[:count]):
-                try:
-                    await self.approve_chat_join_request(self.channel_id, req["user_id"])
-                    # Добавляем в подписчики
-                    self.add_subscriber(req["user_id"])
-                    # Приветствие уже отправлено при подаче заявки
-                    accepted_count += 1
-                except Exception as e:
-                    logger.error(f"Ошибка приема пользователя {req['user_id']}: {e}")
-            
-            # Удаляем принятых из всех списков
-            for req in matching_requests[:count]:
-                self.pending_requests = [r for r in self.pending_requests if r["user_id"] != req["user_id"]]
-                if req["user_id"] in self.user_requests:
-                    del self.user_requests[req["user_id"]]
-                if req["user_id"] in self.sent_welcomes:
-                    self.sent_welcomes.remove(req["user_id"])
-            
-            await self.send_message(message["chat"]["id"], f"✅ Принято {accepted_count} пользователей с даты {date_str}")
-            
+            if count <= 0:
+                raise ValueError
         except ValueError:
-            await self.send_message(message["chat"]["id"], "❌ Введите корректное число.")
+            await self.send_message(message["chat"]["id"], "Введите целое число больше нуля.")
+            self.waiting_for_date_count = True
+            return
+        date_str = (self.current_schedule_data or {}).get('date')
+        matching = [r for r in self.pending_requests if r.get("date") == date_str][:count]
+        accepted = await self.approve_requests(matching)
+        await self.send_message(message["chat"]["id"], f"✅ Принято: {accepted}. Ошибочные заявки остаются в очереди.")
 
     async def handle_schedule_time_input(self, message, time_text):
         """Обработка ввода времени для расписания"""
@@ -2596,18 +2280,18 @@ class SimpleBot:
     async def handle_schedule_day_selection(self, message, data):
         """Обработка выбора дня недели для расписания"""
         day_data = data.replace("schedule_day_", "")
-        
+
         if day_data == "daily":
             day_name = "Ежедневно"
         else:
             days = ["Воскресенье", "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
             day_name = days[int(day_data)]
-        
+
         text = f"⏰ <b>Прием по расписанию</b>\n\n"
         text += f"Выбран день: {day_name}\n"
         text += f"В очереди: {len(self.pending_requests)} пользователей\n\n"
         text += "Выберите количество для приема:"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "1", "callback_data": f"schedule_count_1_{day_data}"}, {"text": "5", "callback_data": f"schedule_count_5_{day_data}"}],
@@ -2617,7 +2301,7 @@ class SimpleBot:
                 [{"text": "❌ Отмена", "callback_data": "accept_menu"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def handle_schedule_count_selection(self, message, data):
@@ -2626,71 +2310,72 @@ class SimpleBot:
         parts = data.replace("schedule_count_", "").split("_")
         count = parts[0]  # "5", "all" или "custom"
         day_data = parts[1]  # "daily" или "1"
-        
+
         if count == "custom":
             # Сохраняем данные и переходим в режим ввода количества
             self.waiting_for_schedule_count = True
             self.current_schedule_data = {"day": day_data}
-            
+
             if day_data == "daily":
                 day_name = "Ежедневно"
             else:
                 days = ["Воскресенье", "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
                 day_name = days[int(day_data)]
-            
+
             text = f"⏰ <b>Прием по расписанию</b>\n\n"
             text += f"День: {day_name}\n"
             text += f"В очереди: {len(self.pending_requests)} пользователей\n\n"
             text += "Введите количество людей для приема:"
-            
+
             keyboard = {
                 "inline_keyboard": [
                     [{"text": "❌ Отмена", "callback_data": "accept_menu"}]
                 ]
             }
-            
+
             await self.show_screen(message, text, keyboard)
             return
-        
+
         if day_data == "daily":
             day_name = "Ежедневно"
         else:
             days = ["Воскресенье", "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
             day_name = days[int(day_data)]
-        
+
         # Сохраняем данные и активируем ожидание времени
         self.waiting_for_schedule_time = True
         self.current_schedule_data = {"day": day_data, "count": count if count != "all" else "all"}
-        
+
         text = f"⏰ <b>Прием по расписанию</b>\n\n"
         text += f"День: {day_name}\n"
         text += f"Количество: {'Все' if count == 'all' else count}\n"
         text += f"В очереди: {len(self.pending_requests)} пользователей\n\n"
         text += "Введите время в формате ЧЧ:ММ (например, 14:30):"
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "❌ Отмена", "callback_data": "accept_menu"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def handle_delay_selection(self, message, data):
         """Обработка выбора задержки"""
         delay_text = data.replace("delay_", "")
         delay_seconds = self.parse_delay(delay_text)
-        
+
         if delay_seconds is not None:
             self.auto_delay = delay_seconds
+            self.save_settings()
             text = f"✅ Задержка автоприема установлена: {delay_text}"
-            
+
             keyboard = {
                 "inline_keyboard": [
                     [{"text": "⬅️ Назад", "callback_data": "accept_menu"}]
                 ]
             }
-            
+
             await self.show_screen(message, text, keyboard)
 
     def parse_delay(self, delay_text):
@@ -2720,7 +2405,7 @@ class SimpleBot:
     async def handle_welcome_text(self, message, text):
         """Обработка текстового приветствия от админа"""
         self.waiting_for_welcome_text = False  # Сбрасываем состояние
-        
+
         # Добавляем приветственное сообщение
         welcome_msg = {
             "text": text,
@@ -2731,11 +2416,11 @@ class SimpleBot:
             "url_buttons": [],
             "created_at": datetime.now().isoformat()
         }
-        
+
         self.welcome_messages.append(welcome_msg)
         self.save_welcome_messages()
-        
-        await self.send_message(message["chat"]["id"], 
+
+        await self.send_message(message["chat"]["id"],
                               f"✅ <b>Приветственное сообщение добавлено!</b>\n\n"
                               f"Текст: {html.escape(text[:100])}{'...' if len(text) > 100 else ''}\n"
                               f"Задержка: 0 секунд\n"
@@ -2748,7 +2433,7 @@ class SimpleBot:
         self.waiting_for_welcome_text = False  # Сбрасываем состояние
         photo = message["photo"][-1]  # Берем самое большое фото
         caption = message.get("caption", "")
-        
+
         # Добавляем приветственное сообщение с фото
         welcome_msg = {
             "text": caption,
@@ -2760,11 +2445,11 @@ class SimpleBot:
             "url_buttons": [],
             "created_at": datetime.now().isoformat()
         }
-        
+
         self.welcome_messages.append(welcome_msg)
         self.save_welcome_messages()
-        
-        await self.send_message(message["chat"]["id"], 
+
+        await self.send_message(message["chat"]["id"],
                               f"✅ <b>Приветственное сообщение с фото добавлено!</b>\n\n"
                               f"Описание: {html.escape(caption[:100]) if caption else 'Без описания'}\n"
                               f"Задержка: 0 секунд\n"
@@ -2777,7 +2462,7 @@ class SimpleBot:
         self.waiting_for_welcome_text = False  # Сбрасываем состояние
         document = message["document"]
         caption = message.get("caption", "")
-        
+
         # Добавляем приветственное сообщение с документом
         welcome_msg = {
             "text": caption,
@@ -2789,11 +2474,11 @@ class SimpleBot:
             "url_buttons": [],
             "created_at": datetime.now().isoformat()
         }
-        
+
         self.welcome_messages.append(welcome_msg)
         self.save_welcome_messages()
-        
-        await self.send_message(message["chat"]["id"], 
+
+        await self.send_message(message["chat"]["id"],
                               f"✅ <b>Приветственное сообщение с файлом добавлено!</b>\n\n"
                               f"Описание: {html.escape(caption[:100]) if caption else 'Без описания'}\n"
                               f"Файл: {document.get('file_name', 'Неизвестно')}\n"
@@ -2807,7 +2492,7 @@ class SimpleBot:
         self.waiting_for_welcome_text = False  # Сбрасываем состояние
         video = message["video"]
         caption = message.get("caption", "")
-        
+
         # Добавляем приветственное сообщение с видео
         welcome_msg = {
             "text": caption,
@@ -2819,11 +2504,11 @@ class SimpleBot:
             "url_buttons": [],
             "created_at": datetime.now().isoformat()
         }
-        
+
         self.welcome_messages.append(welcome_msg)
         self.save_welcome_messages()
-        
-        await self.send_message(message["chat"]["id"], 
+
+        await self.send_message(message["chat"]["id"],
                               f"✅ <b>Приветственное сообщение с видео добавлено!</b>\n\n"
                               f"Описание: {html.escape(caption[:100]) if caption else 'Без описания'}\n"
                               f"Видео: {video.get('file_name', 'GIF/Видео')}\n"
@@ -2838,11 +2523,11 @@ class SimpleBot:
             welcome_id = int(data.replace("welcome_edit_", ""))
         except ValueError:
             welcome_id = 0
-        
+
         if not 0 <= welcome_id < len(self.welcome_messages):
             await self.welcome_not_found(message)
             return
-        
+
         welcome_msg = self.welcome_messages[welcome_id]
 
         keyboard = {
@@ -2884,7 +2569,7 @@ class SimpleBot:
             message["chat"]["id"], message["message_id"],
             "✏️ <b>Изменение приветствия</b>\n\n"
             "Отправьте новый текст. Можно использовать жирный, курсив, "
-            "подчёркивание и скрытые ссылки Telegram.\n\n"
+            "подчёркивание, скрытые ссылки и Premium-эмодзи Telegram. Просто вставьте эмодзи в сообщение.\n\n"
             "Для фото, видео или файла это заменит подпись.",
             {"inline_keyboard": [[
                 {"text": "❌ Отмена", "callback_data": f"welcome_edit_{welcome_id}"}
@@ -2900,13 +2585,13 @@ class SimpleBot:
             await self.send_message(message["chat"]["id"], "❌ Приветствие не найдено!")
             return
 
-        new_text = message.get("text", "")
+        new_text = message.get("text", message.get("caption", ""))
         if not new_text.strip():
             await self.send_message(message["chat"]["id"], "❌ Текст не может быть пустым.")
             return
 
         self.welcome_messages[welcome_id]["text"] = new_text
-        self.welcome_messages[welcome_id]["entities"] = message.get("entities", [])
+        self.welcome_messages[welcome_id]["entities"] = message.get("entities", message.get("caption_entities", []))
         self.save_welcome_messages()
         self.waiting_for_welcome_text_edit = False
         self.current_welcome_text_id = None
@@ -2917,65 +2602,10 @@ class SimpleBot:
         await self.show_welcome_edit_menu(message, f"welcome_edit_{welcome_id}")
 
     async def send_welcome_preview(self, chat_id, welcome_msg):
-        """Отправить предпросмотр приветствия"""
-        try:
-            if welcome_msg["type"] == "text":
-                preview_text = f"📋 <b>Предпросмотр:</b>\n\n{welcome_msg['text']}"
-                await self.send_message(chat_id, preview_text)
-            elif welcome_msg["type"] == "photo":
-                await self.send_photo(chat_id, welcome_msg["photo_id"], 
-                                    f"📋 <b>Предпросмотр фото:</b>\n\n{welcome_msg['text']}")
-            elif welcome_msg["type"] == "document":
-                await self.send_document(chat_id, welcome_msg["document_id"], 
-                                       f"📋 <b>Предпросмотр файла:</b>\n\n{welcome_msg['text']}")
-        except Exception as e:
-            await self.send_message(chat_id, f"❌ Ошибка предпросмотра: {e}")
+        return await self.send_welcome_preview_with_id(chat_id, welcome_msg)
 
     async def send_welcome_preview_with_id(self, chat_id, welcome_msg):
-        """Отправить предпросмотр приветствия и вернуть response с ID"""
-        try:
-            # Создаем URL кнопки если есть
-            reply_markup = None
-            if welcome_msg.get("url_buttons"):
-                keyboard = []
-                for button in welcome_msg["url_buttons"]:
-                    keyboard.append([{"text": button["text"], "url": button["url"]}])
-                reply_markup = {"inline_keyboard": keyboard}
-            
-            if welcome_msg["type"] == "text":
-                if "entities" in welcome_msg:
-                    return await self.send_message_with_markup(
-                        chat_id, welcome_msg["text"], reply_markup,
-                        entities=welcome_msg["entities"],
-                    )
-                preview_text = f"📋 <b>Предпросмотр:</b>\n\n{welcome_msg['text']}"
-                return await self.send_message_with_markup(chat_id, preview_text, reply_markup)
-            elif welcome_msg["type"] == "photo":
-                if "entities" in welcome_msg:
-                    return await self.send_photo_with_markup(
-                        chat_id, welcome_msg["photo_id"], welcome_msg["text"], reply_markup,
-                        entities=welcome_msg["entities"],
-                    )
-                caption = f"📋 <b>Предпросмотр фото:</b>\n\n{welcome_msg['text']}"
-                return await self.send_photo_with_markup(chat_id, welcome_msg["photo_id"], caption, reply_markup)
-            elif welcome_msg["type"] == "document":
-                if "entities" in welcome_msg:
-                    return await self.send_document_with_markup(
-                        chat_id, welcome_msg["document_id"], welcome_msg["text"], reply_markup,
-                        entities=welcome_msg["entities"],
-                    )
-                caption = f"📋 <b>Предпросмотр файла:</b>\n\n{welcome_msg['text']}"
-                return await self.send_document_with_markup(chat_id, welcome_msg["document_id"], caption, reply_markup)
-            elif welcome_msg["type"] == "video":
-                if "entities" in welcome_msg:
-                    return await self.send_video_with_markup(
-                        chat_id, welcome_msg["video_id"], welcome_msg["text"], reply_markup,
-                        entities=welcome_msg["entities"],
-                    )
-                caption = f"📋 <b>Предпросмотр видео:</b>\n\n{welcome_msg['text']}"
-                return await self.send_video_with_markup(chat_id, welcome_msg["video_id"], caption, reply_markup)
-        except Exception as e:
-            return await self.send_message(chat_id, f"❌ Ошибка предпросмотра: {e}")
+        return await self.send_single_welcome({"id": chat_id}, welcome_msg)
 
     async def show_welcome_preview(self, message, data):
         """Показать предпросмотр приветствия"""
@@ -2983,13 +2613,13 @@ class SimpleBot:
             welcome_id = int(data.replace("welcome_preview_", ""))
         except ValueError:
             welcome_id = 0
-        
+
         if not 0 <= welcome_id < len(self.welcome_messages):
             await self.welcome_not_found(message)
             return
-        
+
         welcome_msg = self.welcome_messages[welcome_id]
-        
+
         # Отправляем предпросмотр как отдельное сообщение
         await self.send_welcome_preview_with_id(message["chat"]["id"], welcome_msg)
 
@@ -3006,14 +2636,14 @@ class SimpleBot:
             return
 
         text = "⏱️ <b>Выберите задержку отправки</b>"
-        
+
         keyboard = {
             "inline_keyboard": [
-                [{"text": "0 сек", "callback_data": f"set_delay_{welcome_id}_0"}, 
+                [{"text": "0 сек", "callback_data": f"set_delay_{welcome_id}_0"},
                  {"text": "30 сек", "callback_data": f"set_delay_{welcome_id}_30"}],
                 [{"text": "1 мин", "callback_data": f"set_delay_{welcome_id}_60"},
                  {"text": "5 мин", "callback_data": f"set_delay_{welcome_id}_300"}],
-                [{"text": "30 мин", "callback_data": f"set_delay_{welcome_id}_1800"}, 
+                [{"text": "30 мин", "callback_data": f"set_delay_{welcome_id}_1800"},
                  {"text": "1 час", "callback_data": f"set_delay_{welcome_id}_3600"}],
                 [{"text": "6 часов", "callback_data": f"set_delay_{welcome_id}_21600"},
                  {"text": "12 часов", "callback_data": f"set_delay_{welcome_id}_43200"}],
@@ -3027,7 +2657,7 @@ class SimpleBot:
                 [{"text": "⬅️ Назад", "callback_data": f"welcome_edit_{welcome_id}"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def set_welcome_delay(self, message, data):
@@ -3035,11 +2665,11 @@ class SimpleBot:
         parts = data.replace("set_delay_", "").split("_")
         welcome_id = int(parts[0])
         delay = int(parts[1])
-        
+
         if not 0 <= welcome_id < len(self.welcome_messages):
             await self.welcome_not_found(message)
             return
-        
+
         welcome_msg = self.welcome_messages[welcome_id]
         welcome_msg["delay"] = delay
         # После сохранения список пересортируется по времени, поэтому номер
@@ -3057,11 +2687,11 @@ class SimpleBot:
             welcome_id = int(data.replace("welcome_delete_", ""))
         except ValueError:
             welcome_id = 0
-        
+
         if not 0 <= welcome_id < len(self.welcome_messages):
             await self.welcome_not_found(message)
             return
-        
+
         removed = self.welcome_messages[welcome_id]
         removed_key = removed.get("id") or removed.get("created_at")
         del self.welcome_messages[welcome_id]
@@ -3072,7 +2702,7 @@ class SimpleBot:
                 if job.get("welcome_key") != removed_key
             ]
             self.save_pending_welcome_jobs()
-        
+
         await self.notify("Приветствие удалено")
         await self.show_welcome_menu(message)
 
@@ -3082,15 +2712,15 @@ class SimpleBot:
             welcome_id = int(data.replace("welcome_toggle_", ""))
         except ValueError:
             welcome_id = 0
-        
+
         if not 0 <= welcome_id < len(self.welcome_messages):
             await self.welcome_not_found(message)
             return
-        
+
         welcome_msg = self.welcome_messages[welcome_id]
         welcome_msg["active"] = not welcome_msg.get("active", True)
         self.save_welcome_messages()
-        
+
         status = "включено" if welcome_msg["active"] else "выключено"
         await self.notify(f"Приветствие {status}")
 
@@ -3103,11 +2733,11 @@ class SimpleBot:
             welcome_id = int(data.replace("clear_buttons_", ""))
         except ValueError:
             welcome_id = 0
-        
+
         if not 0 <= welcome_id < len(self.welcome_messages):
             await self.welcome_not_found(message)
             return
-        
+
         self.welcome_messages[welcome_id]["url_buttons"] = []
         self.save_welcome_messages()
 
@@ -3119,53 +2749,33 @@ class SimpleBot:
     async def handle_url_buttons_input(self, message, text):
         """Обработка ввода URL кнопок"""
         welcome_id = self.current_editing_id
-        
+
         if welcome_id is None or welcome_id >= len(self.welcome_messages):
             await self.send_message(message["chat"]["id"], "❌ Ошибка: приветствие не найдено!")
             self.waiting_for_buttons = False
             return
-        
-        # Парсим и валидируем кнопки
-        url_buttons = []
-        invalid_lines = []
-        lines = text.split('\n')
-        for line_number, line in enumerate(lines, start=1):
-            if '|' in line:
-                parts = line.split('|', 1)
-                if len(parts) == 2:
-                    button_text = parts[0].strip()
-                    button_url = parts[1].strip()
-                    valid_url = re.match(r"^(?:https?://|tg://)\S+$", button_url, re.IGNORECASE)
-                    if button_text and len(button_text) <= 64 and valid_url:
-                        url_buttons.append({"text": button_text, "url": button_url})
-                    else:
-                        invalid_lines.append(line_number)
-            elif line.strip():
-                invalid_lines.append(line_number)
 
-        if invalid_lines or not url_buttons:
-            await self.send_message(
-                message["chat"]["id"],
-                "❌ Кнопки не сохранены. Проверьте формат <b>Текст | https://ссылка</b> "
-                f"в строках: {', '.join(map(str, invalid_lines or [1]))}.",
-            )
+        try:
+            url_buttons = parse_buttons(text, message.get("entities", []))
+        except ValueError as error:
+            await self.send_message(message["chat"]["id"], html.escape(str(error)) + "\n\n" + BUTTON_HELP)
             return
-        
+
         # Сохраняем кнопки
         self.welcome_messages[welcome_id]["url_buttons"] = url_buttons
         self.save_welcome_messages()
-        
+
         # Сбрасываем состояние
         self.waiting_for_buttons = False
         self.current_editing_id = None
-        
+
         # Отправляем подтверждение
         await self.send_message(message["chat"]["id"], f"✅ Добавлено {len(url_buttons)} кнопок!")
-        
+
         # Возвращаемся к редактированию
         # Создаем фиктивное сообщение для вызова метода
         fake_message = {
-            "chat": {"id": message["chat"]["id"]}, 
+            "chat": {"id": message["chat"]["id"]},
             "message_id": message.get("message_id", 0)
         }
         await self.show_welcome_edit_menu(fake_message, f"welcome_edit_{welcome_id}")
@@ -3177,134 +2787,72 @@ class SimpleBot:
             welcome_id = int(data.replace("welcome_buttons_", ""))
         except ValueError:
             welcome_id = 0
-        
+
         if not 0 <= welcome_id < len(self.welcome_messages):
             await self.welcome_not_found(message)
             return
-        
+
         welcome_msg = self.welcome_messages[welcome_id]
         buttons = welcome_msg.get("url_buttons", [])
-        
+
         text = f"🔗 <b>URL кнопки для приветствия #{welcome_id + 1}</b>\n\n"
-        
+
         if buttons:
             text += "Текущие кнопки:\n"
             for i, btn in enumerate(buttons):
-                text += f"{i+1}. {btn['text']} → {btn['url']}\n"
+                text += f"{i+1}. {html.escape(btn['text'])} → {html.escape(btn['url'])} · {html.escape(btn.get('style', 'обычный'))}\n"
         else:
             text += "URL кнопки не настроены.\n"
-        
-        text += "\n💡 Отправьте кнопки в формате:\nТекст кнопки | URL\nТекст кнопки 2 | URL2"
-        
+
+        text += "\n" + BUTTON_HELP
+
         # Активируем режим ожидания кнопок
         self.waiting_for_buttons = True
         self.current_editing_id = welcome_id
-        
+
         keyboard = {
             "inline_keyboard": [
                 [{"text": "🗑️ Очистить все", "callback_data": f"clear_buttons_{welcome_id}"}],
                 [{"text": "⬅️ Назад", "callback_data": f"welcome_edit_{welcome_id}"}]
             ]
         }
-        
+
         await self.show_screen(message, text, keyboard)
 
     async def check_schedule(self):
-        """Проверка и выполнение расписания"""
-        if not self.schedules:
-            return
-        
-        from datetime import datetime
-        now = datetime.now()
-        current_time = now.strftime("%H:%M")
-        current_weekday = now.weekday()  # 0=Понедельник, 6=Воскресенье
-        
-        # Проверяем все расписания
-        for day_data, schedule in self.schedules.items():
-            if not schedule.get("active", False):
-                continue
-            
-            # Проверяем время
-            if current_time != schedule["time"]:
-                continue
-            
-            # Проверяем день недели
-            if day_data != "daily":
-                # Конвертируем в наш формат (0=Воскресенье, 1=Понедельник...)
-                if day_data == "0":  # Воскресенье
-                    target_weekday = 6
-                else:
-                    target_weekday = int(day_data) - 1
-                
-                if current_weekday != target_weekday:
-                    continue
-            
-            # Выполняем прием для этого дня
-            count = schedule["count"]
-            if count == "all":
-                target_count = len(self.pending_requests)
-            else:
-                target_count = min(int(count), len(self.pending_requests))
-            
-            if target_count == 0:
-                continue
-            
-            # Принимаем пользователей
-            accepted_count = 0
-            for i, req in enumerate(self.pending_requests[:target_count]):
-                try:
-                    await self.approve_chat_join_request(self.channel_id, req["user_id"])
-                    # Добавляем в подписчики
-                    self.add_subscriber(req["user_id"])
-                    # Приветствие уже отправлено при подаче заявки
-                    accepted_count += 1
-                except Exception as e:
-                    logger.error(f"Ошибка приема пользователя {req['user_id']}: {e}")
-            
-            # Удаляем принятых из всех списков
-            for i in range(target_count):
-                if i < len(self.pending_requests):
-                    req = self.pending_requests[i]
-                    if req["user_id"] in self.user_requests:
-                        del self.user_requests[req["user_id"]]
-                    if req["user_id"] in self.sent_welcomes:
-                        self.sent_welcomes.remove(req["user_id"])
-            self.pending_requests = self.pending_requests[target_count:]
-            
-            # Уведомляем админа
-            if accepted_count > 0:
-                day_name = "Ежедневно" if day_data == "daily" else ["Воскресенье", "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"][int(day_data)]
-                for admin_id in self.admin_ids:
-                    await self.send_message(admin_id, f"⏰ <b>Расписание выполнено!</b>\n\nДень: {day_name}\nВремя: {schedule['time']}\nПринято пользователей: {accepted_count}")
-            
-            logger.info(f"Расписание выполнено для {day_data}: принято {accepted_count} пользователей")
-
-    async def check_daily_broadcast(self):
-        """Запустить сохранённый черновик один раз в сутки по московскому времени."""
-        schedule = self.daily_broadcast
-        if not schedule.get("enabled") or not schedule.get("items"):
-            return
-
         now = self.moscow_now()
         today = now.date().isoformat()
-        if now.strftime("%H:%M") != schedule.get("time"):
+        for day, schedule in list(self.schedules.items()):
+            if not schedule.get("active") or not self.valid_schedule_time(schedule.get("time", "")):
+                continue
+            if now.strftime("%H:%M") < schedule["time"] or schedule.get("last_run_date") == today:
+                continue
+            if day != "daily" and (6 if day == "0" else int(day) - 1) != now.weekday():
+                continue
+            schedule["last_run_date"] = today
+            self.save_settings()
+            count = schedule.get("count", "all")
+            requests = list(self.pending_requests) if count == "all" else self.pending_requests[:max(0, int(count))]
+            accepted = await self.approve_requests(requests)
+            if accepted:
+                for admin in self.admin_ids:
+                    await self.send_message(admin, f"⏰ Расписание {schedule['time']} МСК: принято {accepted}.")
+
+    async def check_daily_broadcast(self):
+        schedule = self.daily_broadcast
+        if not schedule.get("enabled") or not schedule.get("items") or not self.admin_ids:
+            return
+        now = self.moscow_now()
+        today = now.date().isoformat()
+        if not self.valid_schedule_time(schedule.get("time", "")) or now.strftime("%H:%M") < schedule["time"]:
             return
         if schedule.get("last_sent_date") == today:
             return
-
-        # Сохраняем дату до запуска: после перезапуска в эту минуту не будет
-        # второй одинаковой рассылки, если первая уже могла быть отправлена.
+        data = {"items": copy.deepcopy(schedule["items"]), "buttons": copy.deepcopy(schedule.get("buttons", []))}
+        # Deterministic ID closes the crash window between journal commit and date save.
+        self.journal.create(data, self.broadcast_targets(), self.admin_ids[0], job_id="daily-" + today)
         schedule["last_sent_date"] = today
         self.save_settings()
-        data = {
-            "items": list(schedule["items"]),
-            "buttons": list(schedule.get("buttons", [])),
-        }
-        admin_chat_id = self.admin_ids[0]
-        logger.info(f"Запуск ежедневной рассылки на {today} в {schedule['time']} МСК")
-        asyncio.create_task(self.execute_broadcast_async(
-            {"chat": {"id": admin_chat_id}}, data
-        ))
 
     async def send_video_with_markup(self, chat_id, video_id, caption, reply_markup=None, entities=None):
         """Отправить видео с разметкой"""
@@ -3324,30 +2872,52 @@ class SimpleBot:
         return await self.make_request_with_retry('POST', url, data)
 
     async def run(self):
-        """Запуск бота"""
-        logger.info("Бот запущен!")
-        self.is_running = True
+        try:
+            await self._run_connected()
+        finally:
+            self.is_running = False
+            tasks = list(self.background_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await self.close_session()
 
-        # Инициализируем HTTP сессию
+    async def _run_connected(self):
+        """Запуск бота"""
+        if not self.bot_token or not self.admin_ids:
+            raise ValueError("Задайте BOT_TOKEN и ADMIN_IDS в .env или Environment хостинга")
         await self.initialize_session()
+        me = await self.make_request_with_retry('GET', f"{self.base_url}/getMe")
+        if not me.get("ok"):
+            await self.close_session()
+            raise RuntimeError(f"Telegram getMe: {me.get('error_code', 0)}. Проверьте BOT_TOKEN в Environment хостинга.")
+        self.bot_username = me["result"]["username"]
+        logger.info("Бот @%s запущен, токен проверен", self.bot_username)
+        self.is_running = True
+        self.spawn(self.delivery_tick())
 
         offset = None
 
         while self.is_running:
             try:
                 updates = await self.get_updates(offset)
-                
+
                 if not updates.get("ok"):
+                    if updates.get("error_code") in (401, 409):
+                        self.is_running = False
+                        logger.error("getUpdates: %s. Проверьте токен и отсутствие второй копии или webhook.", updates.get("error_code"))
+                        raise RuntimeError("Опрос Telegram остановлен: токен отклонён или запущена вторая копия/webhook")
                     logger.error(f"Ошибка получения обновлений: {updates}")
                     await asyncio.sleep(5)
                     continue
-                
+
                 for update in updates.get("result", []):
                     offset = update["update_id"] + 1
-                    
+
                     if "message" in update:
                         message = update["message"]
-                        
+
                         # Обработка новых участников
                         if "new_chat_members" in message:
                             await self.handle_new_chat_members(message)
@@ -3368,7 +2938,7 @@ class SimpleBot:
 
                             # Создаем данные заявки эффективно
                             from datetime import datetime
-                            current_time = datetime.now()
+                            current_time = datetime.fromtimestamp(req.get("date", time.time()), ZoneInfo("Europe/Moscow"))
                             request_data = {
                                 "user_id": user["id"],
                                 "username": user.get("username", ""),
@@ -3382,6 +2952,7 @@ class SimpleBot:
                             # Добавляем в оба списка атомарно
                             self.pending_requests.append(request_data)
                             self.user_requests[user["id"]] = request_data
+                            atomic_json("pending_requests.json", self.pending_requests)
 
                             # Логируем успешное добавление заявки
                             logger.info(f"Новая заявка от @{user.get('username', user['id'])} (всего: {len(self.pending_requests)})")
@@ -3392,6 +2963,7 @@ class SimpleBot:
                                 await self.send_welcome_to_user({
                                     "id": user["id"],
                                     "join_chat_id": req.get("user_chat_id"),
+                                    "request_time": req.get("date", time.time()),
                                 })
                             except Exception as e:
                                 logger.error(f"Ошибка отправки приветствия пользователю {user['id']}: {e}")
@@ -3401,33 +2973,36 @@ class SimpleBot:
                                 delay = self.auto_delay if self.auto_delay else 0
                                 if delay > 0:
                                     # Создаем задачу с задержкой для автоприема
-                                    asyncio.create_task(self.delayed_auto_accept(user["id"], delay))
+                                    self.spawn(self.delayed_auto_accept(user["id"], delay))
                                 else:
                                     # Немедленный автоприем
-                                    asyncio.create_task(self.approve_chat_join_request(self.channel_id, user["id"]))
-                                    # Добавляем в подписчики
-                                    self.add_subscriber(user["id"])
-                                    # Удаляем из списков после одобрения
-                                    self._remove_request_safely(user["id"])
+                                    await self.delayed_auto_accept(user["id"], 0)
                             else:
                                 logger.debug(f"Заявка сохранена в режиме ручного приема: {user['id']}")
 
+                    elif "my_chat_member" in update:
+                        await self.handle_membership(update["my_chat_member"])
                     elif "callback_query" in update:
                         await self.handle_callback_query(update["callback_query"])
-                
-                # Проверяем расписание
-                await self.process_pending_welcome_jobs()
-                await self.check_schedule()
-                await self.check_daily_broadcast()
-                
+
+
                 # Оптимизированный интервал для стабильной работы
                 await asyncio.sleep(1.5)
-                
+
+            except RuntimeError:
+                if not self.is_running:
+                    raise
+                logger.error("Ошибка обработки обновления")
+                await asyncio.sleep(5)
             except Exception as e:
-                logger.error(f"Ошибка в основном цикле: {e}")
+                logger.error(f"Ошибка в основном цикле: {type(e).__name__}")
                 await asyncio.sleep(5)
 
-        # Очищаем ресурсы при завершении
+        # Cancel tasks before closing their shared HTTP session.
+        for task in list(self.background_tasks):
+            task.cancel()
+        if self.background_tasks:
+            await asyncio.gather(*list(self.background_tasks), return_exceptions=True)
         await self.close_session()
         logger.info("Бот остановлен!")
 
@@ -3443,48 +3018,35 @@ class SimpleBot:
                 del self.user_requests[user_id]
             if user_id in self.sent_welcomes:
                 self.sent_welcomes.remove(user_id)
+            atomic_json("pending_requests.json", self.pending_requests)
         except Exception as e:
             logger.error(f"Ошибка удаления заявки {user_id}: {e}")
 
     async def delayed_auto_accept(self, user_id, delay):
-        """Выполнить автоприем с задержкой асинхронно"""
-        try:
+        if delay:
             await asyncio.sleep(delay)
-            # Проверяем, не была ли уже обработана заявка
-            if user_id in self.user_requests:
-                await self.approve_chat_join_request(self.channel_id, user_id)
-                # Добавляем в подписчики
-                self.add_subscriber(user_id)
-                self._remove_request_safely(user_id)
-                logger.info(f"Автоприем выполнен для пользователя {user_id} с задержкой {delay}с")
-        except Exception as e:
-            logger.error(f"Ошибка автоприема пользователя {user_id}: {e}")
+        request = self.user_requests.get(user_id)
+        if request:
+            await self.approve_requests([request])
+
+def main():
+    from pathlib import Path
+    from runtime_guard import ProcessLease
+    source_dir = Path(__file__).resolve().parent
+    load_dotenv(source_dir / '.env')
+    data_dir = Path(os.getenv('BOT_DATA_DIR', str(source_dir))).resolve()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    os.chdir(data_dir)
+    try:
+        with ProcessLease(data_dir / 'bot.lock'):
+            bot = SimpleBot()
+            asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        logger.info('Бот остановлен пользователем')
+    except Exception as error:
+        logger.error('Запуск остановлен: %s', error)
+        raise SystemExit(1)
+
 
 if __name__ == "__main__":
-    print("🚀 Запуск оптимизированного бота приветствий...")
-    print("📊 Проверяем настройки...")
-
-    bot = SimpleBot()
-
-    # Проверяем токен и настройки
-    print(f"🔑 Токен: {bot.bot_token[:10]}...")
-    print(f"📢 Канал ID: {bot.channel_id}")
-    print(f"👤 Админы ID: {bot.admin_ids}")
-
-    # Проверяем приветственные сообщения
-    if bot.welcome_messages:
-        print(f"✅ Загружено приветствий: {len(bot.welcome_messages)}")
-    else:
-        print("⚠️  Приветственные сообщения не найдены")
-
-    print("🔧 Настройки автоприема:", "ВКЛ" if bot.auto_accept else "ВЫКЛ")
-
-    try:
-        print("🌐 Подключение к Telegram API...")
-        asyncio.run(bot.run())
-    except KeyboardInterrupt:
-        print("\n🛑 Получен сигнал завершения...")
-        asyncio.run(bot.stop())
-    except Exception as e:
-        print(f"❌ Критическая ошибка: {e}")
-        logger.error(f"Критическая ошибка при запуске: {e}")
+    main()

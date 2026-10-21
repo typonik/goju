@@ -3,14 +3,7 @@
 Скрипт для запуска Telegram бота приветствия
 """
 
-import sys
-from bot import TelegramBot
-
-def main():
-    """Главная функция запуска бота"""
-    print("🚀 Запуск Telegram бота приветствия...")
-    bot = TelegramBot()
-    bot.run()
+from simple_working_bot import main
 
 if __name__ == "__main__":
     main()

@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Конфигурация бота
-BOT_TOKEN = "8564056187:AAFp3wRhxS0QNZH4hmadjKLuYwsAbA2koG8
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHANNEL_ID = -1001140244688
 
 # Настройки базы данных
