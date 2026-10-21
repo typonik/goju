@@ -1,0 +1,18 @@
+/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/apscheduler/__init__.py:1: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import get_distribution, DistributionNotFound
+🚀 Запуск Telegram бота приветствия...
+Traceback (most recent call last):
+  File "/Users/veronika/borprivet/run.py", line 16, in <module>
+    main()
+    ~~~~^^
+  File "/Users/veronika/borprivet/run.py", line 12, in main
+    bot = TelegramBot()
+  File "/Users/veronika/borprivet/bot.py", line 40, in __init__
+    .build()
+     ~~~~~^^
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/telegram/ext/_applicationbuilder.py", line 312, in build
+    updater = Updater(bot=bot, update_queue=update_queue)
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/telegram/ext/_updater.py", line 128, in __init__
+    self.__polling_cleanup_cb: Optional[Callable[[], Coroutine[Any, Any, None]]] = None
+    ^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Updater' object has no attribute '_Updater__polling_cleanup_cb' and no __dict__ for setting new attributes
