@@ -689,7 +689,10 @@ class SimpleBot(DeliveryMixin):
         """Кнопки получателя и, только в предпросмотре, кнопки управления."""
         rows = [[copy.deepcopy(button)] for button in self.broadcast_buttons]
         if preview:
+            checking = bool((self.broadcast_preview_data or {}).get('include_unknown'))
             rows.extend([
+                [{"text": ("☑" if checking else "☐") + " Разово проверить старые диалоги",
+                  "callback_data": "broadcast_toggle_unknown"}],
                 [{"text": "➕ Добавить кнопку", "callback_data": "broadcast_add_button"}],
                 [{"text": "↩️ Удалить последнюю", "callback_data": "broadcast_remove_button"}],
                 [{"text": "⏰ Отправлять каждый день", "callback_data": "broadcast_schedule_daily"}],
@@ -782,7 +785,9 @@ class SimpleBot(DeliveryMixin):
                     await self.send_message(
                         chat_id,
                         f"✅ Ежедневная рассылка включена: <b>{schedule_time}</b> по Москве.\n"
-                        "Она будет отправляться из сохранённого черновика каждый день."
+                        "Она будет отправляться из сохранённого черновика каждый день только в открытые диалоги "
+                        "и тем, кому ранее удалось доставить сообщение. Проверка старых диалогов разовая: "
+                        "её запускают кнопкой «Отправить рассылку» или проверкой последнего поста."
                     )
                     return
                 elif self.broadcast_waiting_for_button_title:
@@ -940,6 +945,12 @@ class SimpleBot(DeliveryMixin):
             await self.show_statistics(message)
         elif data == "broadcast":
             await self.show_broadcast_menu(message)
+        elif data == "broadcast_audience":
+            await self.send_message(message["chat"]["id"], self.audience_text())
+        elif data == "broadcast_reconcile":
+            await self.prepare_latest_broadcast_check(message)
+        elif data == "broadcast_toggle_unknown":
+            await self.toggle_unknown_audience(message)
         elif data == "broadcast_new":
             self.reset_broadcast_draft()
             self.waiting_for_broadcast = True
@@ -1232,16 +1243,17 @@ class SimpleBot(DeliveryMixin):
             job["attempts"] = int(job.get("attempts", 0)) + 1
             job["last_error"] = self.telegram_error(result)
             code = result.get("error_code", 0)
+            failure = self.delivery_failure(result)
+            if failure:
+                self.remember_delivery(uid, result)
             if result.get("delivery_unknown") or code == 0 or code >= 500:
                 job["status"] = "unknown"
             elif code == 401:
                 job.update(status="pending", due_at=now + WELCOME_RETRY_SECONDS)
-            elif code == 403 and uid not in self.started_users:
+            elif code == 403 and uid not in self.started_users and failure not in ('blocked', 'deactivated'):
                 job["status"] = "waiting_start"
             elif code in (400, 403, 404) or job["attempts"] >= WELCOME_MAX_ATTEMPTS:
                 job["status"] = "failed"
-                if code == 403:
-                    self.recipient(uid, blocked=True)
             else:
                 delay = result.get("parameters", {}).get("retry_after", WELCOME_RETRY_SECONDS)
                 job.update(status="pending", due_at=time.time() + max(1, float(delay)))
@@ -1507,82 +1519,54 @@ class SimpleBot(DeliveryMixin):
         await self.show_screen(message, text, keyboard)
 
     async def show_statistics(self, message):
-        """Показать статистику"""
-        today_count, week_count = self.subscription_counts()
-        text = "📊 <b>Статистика</b>\n\n"
-        text += f"Всего пользователей: {len(self.subscribers)}\n"
-        text += f"Подписок сегодня: {today_count}\n"
-        text += f"Подписок за неделю: {week_count}\n"
-
-        keyboard = {
-            "inline_keyboard": [
-                [{"text": "⬅️ Назад", "callback_data": "back_to_main"}]
-            ]
-        }
-
-        await self.show_screen(message, text, keyboard)
+        today, week = self.subscription_counts()
+        text = ("📊 <b>Статистика</b>\n\n"
+                f"Записей в базе подписчиков: {len(self.subscribers)}\n"
+                f"Добавлено в базу сегодня (МСК): {today}\n"
+                f"Добавлено в базу за 7 дней: {week}\n\n" + self.audience_text())
+        await self.show_screen(message, text, {"inline_keyboard": [
+            [{"text": "📢 К рассылкам", "callback_data": "broadcast"}],
+            [{"text": "⬅️ Назад", "callback_data": "back_to_main"}]]})
 
     async def show_broadcast_menu(self, message):
-        """Показать ручную отправку и состояние ежедневного расписания."""
-        if self.daily_broadcast.get("enabled"):
-            schedule_text = (
-                f"✅ Ежедневная рассылка включена: <b>{self.daily_broadcast['time']}</b> по Москве\n"
-                f"Сохранено сообщений: <b>{len(self.daily_broadcast.get('items', []))}</b>"
-            )
-            schedule_button = {"text": "🛑 Выключить ежедневную", "callback_data": "broadcast_schedule_disable"}
-        else:
-            schedule_text = "Ежедневная рассылка: <b>выключена</b>"
-            schedule_button = None
-
-        keyboard = [[{"text": "🆕 Новая рассылка", "callback_data": "broadcast_new"}]]
-        if schedule_button:
-            keyboard.append([schedule_button])
+        schedule = (f"Ежедневная рассылка: <b>{self.daily_broadcast['time']} МСК</b>"
+                    if self.daily_broadcast.get('enabled') else "Ежедневная рассылка: <b>выключена</b>")
+        keyboard = [[{"text": "🆕 Новая рассылка", "callback_data": "broadcast_new"}],
+                    [{"text": "🔎 Проверить получателей последнего поста", "callback_data": "broadcast_reconcile"}],
+                    [{"text": "👥 Кто получит сообщения", "callback_data": "broadcast_audience"}]]
+        if self.daily_broadcast.get('enabled'):
+            keyboard.append([{"text": "🛑 Выключить ежедневную", "callback_data": "broadcast_schedule_disable"}])
         keyboard.append([{"text": "⬅️ Назад", "callback_data": "back_to_main"}])
-        await self.edit_message(
-            message["chat"]["id"], message["message_id"],
-            f"📢 <b>Рассылки</b>\n\n{schedule_text}\n\n"
-            f"Доступных личных диалогов: <b>{len(self.broadcast_targets())}</b>\n"
-            f"Исторических подписчиков без подтверждённого диалога: <b>{len(self.subscribers - self.started_users)}</b>\n\n"
-            "Рассылка приходит и спустя неделю тем, кто написал боту или нажал «Запустить» и не отписался. "
-            "Вступления в канал недостаточно. Отключение: /stop.\n"
-            "Создайте рассылку; ежедневный режим включается в предпросмотре.\n"
-            + html.escape(self.ui_notice),
-            {"inline_keyboard": keyboard},
-        )
+        await self.edit_message(message['chat']['id'], message['message_id'],
+            "📢 <b>Рассылки</b>\n\n" + schedule + "\n\n" + self.audience_text()
+            + "\n\nПроверка последнего поста не повторяет уже учтённые отправки. "
+              "Сначала показывается предпросмотр, затем требуется подтверждение.\n"
+            + html.escape(self.ui_notice), {"inline_keyboard": keyboard})
 
     async def start_broadcast(self, message):
         """Совместимость с прежним внутренним вызовом меню рассылки."""
         await self.show_broadcast_menu(message)
 
     async def show_broadcast_preview(self, chat_id):
-        """Скопировать черновик самому админу без переписывания его текста."""
         if not self.broadcast_preview_data:
             return
         try:
-            preview_id = None
-            items = self.broadcast_preview_data["items"]
+            items = self.broadcast_preview_data['items']
+            self.broadcast_preview_message_id = None
             for index, item in enumerate(items):
                 markup = self.broadcast_markup(preview=True) if index == len(items) - 1 else None
-                result = await self.copy_message(
-                    chat_id, item["from_chat_id"], item["message_id"], markup
-                )
+                result = await self.send_broadcast_item(chat_id, item, markup)
                 error = self.telegram_error(result)
                 if error:
                     raise RuntimeError(error)
                 if index == len(items) - 1:
-                    preview_id = result["result"]["message_id"]
-            self.broadcast_preview_message_id = preview_id
-            recipients = len(self.broadcast_targets())
-            await self.send_message(
-                chat_id,
-                f"📢 <b>Предпросмотр готов</b>\n"
-                f"Сообщений: <b>{len(items)}</b> · Получателей: <b>{recipients}</b>\n"
-                "Форматирование и медиа выше скопированы Telegram без изменений. "
-                "Кнопки управления находятся под последним сообщением.",
-            )
-        except Exception as e:
-            logger.error(f"Ошибка показа предпросмотра: {e}")
-            await self.send_message(chat_id, f"❌ Не удалось показать предпросмотр: {e}")
+                    self.broadcast_preview_message_id = result['result']['message_id']
+            await self.send_message(chat_id, self.preview_audience_text(self.broadcast_preview_data))
+        except Exception as error:
+            # A failed preview must not leave an actionable unverified draft.
+            self.broadcast_preview_data = None
+            await self.send_message(chat_id, 'Ошибка предпросмотра: ' + html.escape(str(error))
+                                    + '. Отправка отменена; создайте черновик заново.')
 
     async def execute_broadcast(self, message):
         """Выполнить рассылку (старый метод, оставлен для совместимости)"""
@@ -2848,7 +2832,8 @@ class SimpleBot(DeliveryMixin):
             return
         if schedule.get("last_sent_date") == today:
             return
-        data = {"items": copy.deepcopy(schedule["items"]), "buttons": copy.deepcopy(schedule.get("buttons", []))}
+        data = {"items": copy.deepcopy(schedule["items"]), "buttons": copy.deepcopy(schedule.get("buttons", [])),
+                "include_unknown": False, "audience_counts": self.audience_counts()}
         # Deterministic ID closes the crash window between journal commit and date save.
         self.journal.create(data, self.broadcast_targets(), self.admin_ids[0], job_id="daily-" + today)
         schedule["last_sent_date"] = today
@@ -2952,6 +2937,7 @@ class SimpleBot(DeliveryMixin):
                             # Добавляем в оба списка атомарно
                             self.pending_requests.append(request_data)
                             self.user_requests[user["id"]] = request_data
+                            self.recipient(user["id"], join_seen_at=req.get("date", time.time()))
                             atomic_json("pending_requests.json", self.pending_requests)
 
                             # Логируем успешное добавление заявки

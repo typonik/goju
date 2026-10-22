@@ -200,6 +200,26 @@ class Journal:
             c.execute("UPDATE jobs SET status='complete' WHERE id=?", (job,))
             return dict(c.execute('SELECT status,COUNT(*) FROM receipts WHERE job=? GROUP BY status', (job,)))
 
+    def get(self, job):
+        with self.connect() as c:
+            row = c.execute('SELECT id,body,admin,status FROM jobs WHERE id=?', (job,)).fetchone()
+        return (row[0], json.loads(row[1]), row[2], row[3]) if row else None
+
+    def latest(self):
+        with self.connect() as c:
+            row = c.execute("SELECT id FROM jobs WHERE status='complete' ORDER BY created DESC,rowid DESC LIMIT 1").fetchone()
+        return self.get(row[0]) if row else None
+
+    def campaign_seen(self, root):
+        """Reservations count too: another queued follow-up must not reserve them again."""
+        with self.connect() as c:
+            jobs = [j for j, body in c.execute('SELECT id,body FROM jobs')
+                    if j == root or json.loads(body).get('source_job_id') == root]
+            seen = set()
+            for job in jobs:
+                seen.update(r[0] for r in c.execute('SELECT uid FROM receipts WHERE job=?', (job,)))
+        return seen
+
 
 class DeliveryMixin:
     def init_delivery(self):
@@ -208,7 +228,10 @@ class DeliveryMixin:
             raise ValueError('recipient_state.json: ожидался объект; проверьте резервную копию')
         # Only prior direct interaction proves long-lived access. Channel membership does not.
         for uid in self.started_users:
-            self.recipient_state.setdefault(str(uid), {'can_write': True, 'source': 'legacy_start'})
+            s = self.recipient_state.setdefault(str(uid), {})
+            if 'can_write' not in s:
+                s['can_write'] = True
+                s.setdefault('source', 'legacy_start')
         self.journal = Journal()
         self.broadcast_lock = asyncio.Lock()
         self.pace = Pace()
@@ -246,16 +269,155 @@ class DeliveryMixin:
     def register_private(self, uid, restart=False, source='private_message'):
         old = self.recipient_state.get(str(uid), {})
         self.recipient(uid, can_write=True, blocked=False, source=source,
-                       opted_out=False if restart else old.get('opted_out', False))
+                       opted_out=False if restart else old.get('opted_out', False),
+                       delivery_status='available', block_reason='', block_source='',
+                       access_checked_at=time.time())
         if uid not in self.started_users:
             self.started_users.add(uid)
             self.save_started_users()
         if uid not in self.subscribers:
             self.add_subscriber(uid)
 
-    def broadcast_targets(self):
-        return sorted(int(uid) for uid, s in self.recipient_state.items()
-                      if s.get('can_write') and not s.get('blocked') and not s.get('opted_out'))
+    def recipient_category(self, uid):
+        s = self.recipient_state.get(str(uid), {})
+        if s.get('opted_out'):
+            return 'opted_out'
+        if s.get('blocked'):
+            return 'blocked'
+        status = s.get('delivery_status')
+        if status in ('needs_start', 'deactivated', 'unavailable'):
+            return status
+        if s.get('can_write') or status == 'available':
+            return 'confirmed'
+        return 'unknown'
+
+    def audience_pool(self):
+        return set(self.subscribers) | set(self.started_users) | {
+            int(uid) for uid in self.recipient_state if self.recipient_category(int(uid)) == 'confirmed'}
+
+    def audience_counts(self):
+        counts = dict.fromkeys(('confirmed', 'unknown', 'blocked', 'opted_out',
+                                'needs_start', 'deactivated', 'unavailable'), 0)
+        for uid in self.audience_pool():
+            counts[self.recipient_category(uid)] += 1
+        counts['total'] = sum(counts.values())
+        return counts
+
+    def broadcast_targets(self, include_unknown=False):
+        allowed = {'confirmed', 'unknown'} if include_unknown else {'confirmed'}
+        return sorted(uid for uid in self.audience_pool() if self.recipient_category(uid) in allowed)
+
+    def selected_targets(self, data, exclude_seen=True):
+        targets = set(self.broadcast_targets(include_unknown=bool(data.get('include_unknown'))))
+        if 'target_ids' in data:
+            targets.intersection_update(int(uid) for uid in data['target_ids'])
+        if exclude_seen and data.get('source_job_id'):
+            if not self.journal.get(data['source_job_id']):
+                return []
+            targets.difference_update(self.journal.campaign_seen(data['source_job_id']))
+        return sorted(targets)
+
+    def audience_text(self):
+        c = self.audience_counts()
+        legacy_blocks = sum(self.recipient_category(u) == 'blocked'
+                            and not self.recipient_state.get(str(u), {}).get('block_reason')
+                            for u in self.audience_pool())
+        return (f"Всего в базе: <b>{c['total']}</b>\n"
+                f"Диалог открыт / ранее доставлялось: <b>{c['confirmed']}</b>\n"
+                f"Доступ неизвестен — ещё не проверяли: <b>{c['unknown']}</b>\n"
+                f"Блокировка (включая старые отметки): <b>{c['blocked']}</b>\n"
+                f"Отписались: <b>{c['opted_out']}</b>\n"
+                f"Telegram требует запуск бота: <b>{c['needs_start']}</b>\n"
+                f"Удалённые аккаунты: <b>{c['deactivated']}</b>\n"
+                f"Другой отказ доступа: <b>{c['unavailable']}</b>\n\n"
+                f"Старых отметок блокировки без сохранённой причины: <b>{legacy_blocks}</b>. "
+                'Они сохраняются, пока человек не откроет диалог снова.\n'
+                'Неизвестный доступ — не запрет Telegram. Проверка выполняется самим постом '
+                'только после подтверждения отправки. Блокировки и отписки исключены.')
+
+    @staticmethod
+    def delivery_failure(result):
+        """A generic 403 is not evidence that a user blocked the bot."""
+        if result.get('delivery_unknown'):
+            return None
+        code = result.get('error_code', 0)
+        desc = result.get('description', '').lower().replace('’', "'")
+        if code not in (400, 403):
+            return None
+        if 'bot was blocked by the user' in desc or 'bot is blocked by the user' in desc:
+            return 'blocked'
+        if 'user is deactivated' in desc or 'user deactivated' in desc:
+            return 'deactivated'
+        if any(s in desc for s in ("can't initiate conversation", 'cannot initiate conversation',
+                                   'chat not found', 'user not found', "can't send messages to bots")):
+            return 'needs_start'
+        return 'unavailable' if code == 403 else None
+
+    def remember_delivery(self, uid, result):
+        if result.get('ok'):
+            # Record an observation, not a permanent permission or a /start event.
+            self.recipient(uid, delivery_status='available', last_send_ok_at=time.time(),
+                           last_error='', last_error_code=0)
+            return
+        kind = self.delivery_failure(result)
+        if kind:
+            changes = dict(delivery_status=kind, last_error=result.get('description', ''),
+                           last_error_code=result.get('error_code'), access_checked_at=time.time())
+            if kind == 'blocked':
+                changes.update(blocked=True, block_reason=result.get('description', ''), block_source='telegram_api')
+            elif kind in ('needs_start', 'deactivated', 'unavailable'):
+                changes['can_write'] = False
+            self.recipient(uid, **changes)
+
+    def latest_check_data(self):
+        latest = self.journal.latest()
+        if not latest:
+            return None
+        root = latest[1].get('source_job_id') or latest[0]
+        original = self.journal.get(root)
+        if not original or not original[1].get('items'):
+            return None
+        data = {'items': copy.deepcopy(original[1]['items']),
+                'buttons': copy.deepcopy(original[1].get('buttons', [])),
+                'include_unknown': True, 'source_job_id': root}
+        data['target_ids'] = self.selected_targets(data)
+        return data
+
+    async def prepare_latest_broadcast_check(self, message):
+        data = self.latest_check_data()
+        if not data or not data['target_ids']:
+            await self.send_message(message['chat']['id'],
+                'Для проверки последнего поста новых адресатов нет. Уже учтённые отправки, '
+                'блокировки, отписки и явные отказы Telegram исключены.')
+            return
+        self.reset_broadcast_draft()
+        self.broadcast_buttons = copy.deepcopy(data['buttons'])
+        self.broadcast_preview_data = data
+        await self.show_broadcast_preview(message['chat']['id'])
+
+    async def toggle_unknown_audience(self, message):
+        data = self.broadcast_preview_data
+        if not data:
+            await self.notify('Сначала создайте черновик.')
+            return
+        data['include_unknown'] = not data.get('include_unknown', False)
+        await self.edit_message_reply_markup(message['chat']['id'], message['message_id'],
+                                             self.broadcast_markup(preview=True))
+        await self.send_message(message['chat']['id'], self.preview_audience_text(data))
+
+    def preview_audience_text(self, data):
+        selected = self.selected_targets(data)
+        unknown = sum(self.recipient_category(u) == 'unknown' for u in selected)
+        text = (f"📢 <b>Предпросмотр готов</b>\nСообщений: <b>{len(data.get('items', []))}</b> · "
+                f"Получателей: <b>{len(selected)}</b>\n"
+                f"Из них доступ ещё не проверен: <b>{unknown}</b>\n")
+        if data.get('source_job_id'):
+            text += ('Это проверка того же поста для ранее не включённых адресатов. '
+                     'Уже учтённым получателям исходного поста повторно не отправляю.\n')
+        text += ('Без подтверждения ничего не отправляется. Ошибки и результат каждой попытки сохраняются. '
+                 'Проверка старых диалогов разовая; ежедневное расписание использует только '
+                 'открытые диалоги и ранее успешные доставки.')
+        return text
 
     def may_deliver(self, uid):
         s = self.recipient_state.get(str(uid), {})
@@ -271,8 +433,13 @@ class DeliveryMixin:
         chat = update['chat']
         if chat.get('type') == 'private':
             uid = chat['id']
-            blocked = update.get('new_chat_member', {}).get('status') == 'kicked'
-            self.recipient(uid, blocked=blocked)
+            status = update.get('new_chat_member', {}).get('status')
+            if status == 'kicked':
+                self.recipient(uid, blocked=True, block_source='my_chat_member',
+                               block_reason='Telegram: статус kicked в личном диалоге',
+                               access_checked_at=time.time())
+            elif status in ('member', 'administrator'):
+                self.recipient(uid, blocked=False, block_source='', block_reason='')
 
     async def approve_requests(self, requests):
         accepted = 0
@@ -367,14 +534,33 @@ class DeliveryMixin:
         if not data.get('items'):
             await self.send_message(admin, 'В черновике нет сообщений.')
             return
-        job = self.journal.create(copy.deepcopy(data), self.broadcast_targets(), admin, job_id)
         async with self.broadcast_lock:
+            # Select and reserve under the same lock as the sender. Follow-ups exclude
+            # every receipt in the source campaign, including interrupted/reserved ones.
+            if job_id:
+                saved = self.journal.get(job_id)
+                if not saved:
+                    return
+                data = saved[1]
+                admin = saved[2]
+                job = job_id
+            else:
+                data = copy.deepcopy(data)
+                data['audience_counts'] = self.audience_counts()
+                if data.get('source_job_id'):
+                    data['previously_accounted'] = len(self.audience_pool() & self.journal.campaign_seen(data['source_job_id']))
+                targets = self.selected_targets(data)
+                if data.get('source_job_id') and not targets:
+                    await self.send_message(admin, 'Все адресаты этого поста уже учтены. Повторных отправок нет.')
+                    return
+                job = self.journal.create(data, targets, admin)
             # Journal is the source of truth, including on startup recovery.
             if not any(j == job for j, _, _ in self.journal.pending()):
                 return
             await self.send_message(admin, '📤 Рассылка начата. Прогресс сохраняется на диске.')
+            allowed_categories = {'confirmed', 'unknown'} if data.get('include_unknown') else {'confirmed'}
             for uid, start in self.journal.targets(job):
-                if uid not in self.broadcast_targets():
+                if self.recipient_category(uid) not in allowed_categories:
                     self.journal.mark(job, uid, 'skipped', error='Отписка или закрытый диалог')
                     continue
                 for index in range(start, len(data['items'])):
@@ -391,6 +577,7 @@ class DeliveryMixin:
                         last = index == len(data['items']) - 1
                         self.journal.mark(job, uid, 'sent' if last else 'pending', index + 1,
                                           message_id=result.get('result', {}).get('message_id'))
+                        self.remember_delivery(uid, result)
                         continue
                     desc = result.get('description', 'Ошибка Telegram')
                     if result.get('error_code') == 401:
@@ -401,19 +588,33 @@ class DeliveryMixin:
                         self.journal.mark(job, uid, 'pending', error=desc)
                         await self.send_message(admin, 'Рассылка приостановлена: лимит или сбой Telegram. Продолжение автоматически.')
                         return
-                    terminal = result.get('error_code') == 403 or 'chat not found' in desc.lower()
-                    if terminal:
-                        self.recipient(uid, blocked=True, last_error=desc)
-                    state = 'unknown' if result.get('delivery_unknown') or result.get('error_code', 0) == 0 else 'failed'
+                    self.remember_delivery(uid, result)
+                    state = ('unknown' if result.get('delivery_unknown') or result.get('error_code', 0) == 0
+                             or result.get('error_code', 0) >= 500 else self.delivery_failure(result) or 'failed')
                     self.journal.mark(job, uid, state, error=desc)
                     break
             counts = self.journal.finish(job)
+            audience = data.get('audience_counts', self.audience_counts())
             text = ('✅ <b>Рассылка завершена</b>\n'
+                    f"Всего в базе на старте: {audience['total']}\n"
+                    f"Включено в эту отправку: {sum(counts.values())}\n"
                     f"Доставлено полностью: {counts.get('sent', 0)}\n"
+                    f"Telegram требует запуск бота: {counts.get('needs_start', 0)}\n"
+                    f"Telegram сообщил блокировку: {counts.get('blocked', 0)}\n"
+                    f"Удалённые аккаунты: {counts.get('deactivated', 0)}\n"
+                    f"Другой отказ доступа: {counts.get('unavailable', 0)}\n"
                     f"Ошибки: {counts.get('failed', 0)}\n"
                     f"Пропущено (отписка/блокировка): {counts.get('skipped', 0)}\n"
                     f"Результат неизвестен: {counts.get('unknown', 0)}\n"
+                    f"Исключено до отправки — блокировки: {audience['blocked']}, отписки: {audience['opted_out']}, "
+                    f"нужен запуск: {audience['needs_start']}, удалённые: {audience['deactivated']}, "
+                    f"другие отказы: {audience['unavailable']}.\n"
                     'Неизвестные отправки автоматически не повторяются, чтобы не создавать дубли.')
+            if not data.get('include_unknown'):
+                text += f"\nНе проверяли старые диалоги: {audience['unknown']}. Это не ошибки Telegram."
+            if data.get('source_job_id'):
+                text += (f"\nРанее учтено адресатов этого поста: {data.get('previously_accounted', 0)}. "
+                         'Повторных отправок им нет; результаты этой проверки сохраняются отдельно.')
             if self.ui_notice:
                 text += '\n' + html.escape(self.ui_notice)
             await self.send_message(admin, text)
